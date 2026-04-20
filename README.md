@@ -1,30 +1,36 @@
 # Shiro Distributed System
 
-A modular distributed-system control plane that integrates proven capabilities from NATS, etcd, and Cassandra.
+<p align="center">
+  <img src="assets/images/cloud-computing-layers.png" alt="Cloud Layers" width="720" />
+</p>
 
-## Features (Phase 2)
-- Real NATS connection and JetStream-backed publishing
-- Real etcd leader election
-- Real Cassandra durable event storage
-- Health and readiness checks across all modules
-- HTTP APIs for leader status, event publish/list, and live stream
+<p align="center">
+  <a href="https://go.dev/"><img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=for-the-badge&logo=go&logoColor=white"></a>
+  <img alt="Architecture" src="https://img.shields.io/badge/Architecture-Modular-0A66C2?style=for-the-badge&logo=dependabot&logoColor=white">
+  <img alt="Messaging" src="https://img.shields.io/badge/NATS-JetStream-27AE60?style=for-the-badge">
+  <img alt="Coordination" src="https://img.shields.io/badge/etcd-Leader%20Election-34495E?style=for-the-badge">
+  <img alt="Storage" src="https://img.shields.io/badge/Cassandra-Durable%20Events-E67E22?style=for-the-badge">
+  <img alt="API" src="https://img.shields.io/badge/API-REST%20%2B%20SSE-8E44AD?style=for-the-badge">
+</p>
 
-## Endpoints
-- `GET /healthz`: module readiness
-- `GET /leaderz`: current leader and local leadership status
-- `POST /events`: persist event in Cassandra and publish via NATS
-- `GET /events?stream=<name>&limit=<n>`: list recent events from Cassandra
-- `GET /stream?subject=events.>`: live NATS subscription via SSE
+A high-performance distributed-system control plane that combines proven best-in-class patterns:
+- NATS for event streaming and pub/sub
+- etcd for coordination and leader election
+- Cassandra for durable event storage
 
-## Environment Variables
-- `HTTP_ADDR` (default `:8080`)
-- `NODE_ID` (default hostname)
-- `NATS_URL` (default `nats://localhost:4222`)
-- `NATS_STREAM` (default `SHIRO_EVENTS`)
-- `ETCD_ENDPOINTS` (default `localhost:2379`)
-- `LEADER_ELECTION_KEY` (default `/shirods/controlplane/leader`)
-- `CASSANDRA_HOSTS` (default `localhost:9042`)
-- `CASSANDRA_KEYSPACE` (default `shirods`)
+## What You Get
+- Real connection and readiness checks
+- Leader election with observable leader state
+- Event publish and live stream consume
+- Durable event append and query
+- Clean module interfaces for extension
+
+## API Endpoints
+- `GET /healthz` readiness status
+- `GET /leaderz` current leader and node leadership
+- `POST /events` persist + publish event
+- `GET /events?stream=<name>&limit=<n>` list recent events
+- `GET /stream?subject=events.>` live event stream (SSE)
 
 ## Quick Start
 ```bash
@@ -38,3 +44,15 @@ curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
   -d '{"stream":"orders","type":"order.created","payload":{"orderId":"A-1001"}}'
 ```
+
+## Visual Gallery
+<p align="center">
+  <img src="assets/images/internet-map.jpg" alt="Internet map" width="48%" />
+  <img src="assets/images/data-center.jpg" alt="Data center" width="48%" />
+</p>
+
+## Image Credits
+These images are from Wikimedia Commons and should follow their original licenses:
+- Cloud computing layers: https://commons.wikimedia.org/wiki/File:Cloud_computing_layers.png
+- Data center: https://commons.wikimedia.org/wiki/File:Data_Center.jpg
+- Internet map: https://commons.wikimedia.org/wiki/File:Internet_map_1024.jpg
