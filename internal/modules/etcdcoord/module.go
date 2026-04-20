@@ -9,12 +9,21 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
+
+	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/security"
 )
 
 type Module struct {
-	nodeID      string
-	endpoints   []string
-	electionKey string
+	nodeID                string
+	endpoints             []string
+	electionKey           string
+	user                  string
+	password              string
+	tlsCAFile             string
+	tlsCertFile           string
+	tlsKeyFile            string
+	tlsServerName         string
+	tlsInsecureSkipVerify bool
 
 	mu       sync.RWMutex
 	client   *clientv3.Client
@@ -26,11 +35,13 @@ type Module struct {
 	leaderID atomic.Value
 }
 
-func New(nodeID string, endpoints []string, electionKey string) *Module {
+func New(nodeID string, endpoints []string, electionKey, user, password, tlsCAFile, tlsCertFile, tlsKeyFile, tlsServerName string, tlsInsecureSkipVerify bool) *Module {
 	m := &Module{
 		nodeID:      nodeID,
 		endpoints:   endpoints,
 		electionKey: electionKey,
+		user:        user, password: password,
+		tlsCAFile: tlsCAFile, tlsCertFile: tlsCertFile, tlsKeyFile: tlsKeyFile, tlsServerName: tlsServerName, tlsInsecureSkipVerify: tlsInsecureSkipVerify,
 	}
 	m.leaderID.Store("")
 	return m
@@ -39,9 +50,19 @@ func New(nodeID string, endpoints []string, electionKey string) *Module {
 func (m *Module) Name() string { return "etcdcoord" }
 
 func (m *Module) Start(ctx context.Context) error {
+	tlsConfig, err := security.BuildTLSConfig(security.TLSOptions{
+		CAFile: m.tlsCAFile, CertFile: m.tlsCertFile, KeyFile: m.tlsKeyFile, ServerName: m.tlsServerName, InsecureSkipVerify: m.tlsInsecureSkipVerify,
+	})
+	if err != nil {
+		return err
+	}
+
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   m.endpoints,
 		DialTimeout: 5 * time.Second,
+		Username:    m.user,
+		Password:    m.password,
+		TLS:         tlsConfig,
 	})
 	if err != nil {
 		return err

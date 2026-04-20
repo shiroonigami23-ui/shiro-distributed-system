@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: shirods-controlplane
+  namespace: shirods
+  labels:
+    app: shirods-controlplane
+spec:
+  selector:
+    app: shirods-controlplane
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http

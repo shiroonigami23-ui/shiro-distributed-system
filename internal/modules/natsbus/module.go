@@ -10,29 +10,61 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules"
+	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/security"
 )
 
 type Module struct {
-	url        string
-	streamName string
+	url                   string
+	streamName            string
+	user                  string
+	password              string
+	token                 string
+	tlsCAFile             string
+	tlsCertFile           string
+	tlsKeyFile            string
+	tlsServerName         string
+	tlsInsecureSkipVerify bool
 
 	mu sync.RWMutex
 	nc *nats.Conn
 	js nats.JetStreamContext
 }
 
-func New(url, streamName string) *Module {
-	return &Module{url: url, streamName: streamName}
+func New(url, streamName, user, password, token, tlsCAFile, tlsCertFile, tlsKeyFile, tlsServerName string, tlsInsecureSkipVerify bool) *Module {
+	return &Module{
+		url: url, streamName: streamName,
+		user: user, password: password, token: token,
+		tlsCAFile: tlsCAFile, tlsCertFile: tlsCertFile, tlsKeyFile: tlsKeyFile, tlsServerName: tlsServerName, tlsInsecureSkipVerify: tlsInsecureSkipVerify,
+	}
 }
 
 func (m *Module) Name() string { return "natsbus" }
 
 func (m *Module) Start(ctx context.Context) error {
-	nc, err := nats.Connect(
-		m.url,
+	tlsConfig, err := security.BuildTLSConfig(security.TLSOptions{
+		CAFile: m.tlsCAFile, CertFile: m.tlsCertFile, KeyFile: m.tlsKeyFile, ServerName: m.tlsServerName, InsecureSkipVerify: m.tlsInsecureSkipVerify,
+	})
+	if err != nil {
+		return err
+	}
+
+	opts := []nats.Option{
 		nats.Name("shiro-distributed-system"),
 		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
+		nats.ReconnectWait(2 * time.Second),
+	}
+	if m.token != "" {
+		opts = append(opts, nats.Token(m.token))
+	} else if m.user != "" {
+		opts = append(opts, nats.UserInfo(m.user, m.password))
+	}
+	if tlsConfig != nil {
+		opts = append(opts, nats.Secure(tlsConfig))
+	}
+
+	nc, err := nats.Connect(
+		m.url,
+		opts...,
 	)
 	if err != nil {
 		return err
@@ -94,25 +126,29 @@ func (m *Module) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (m *Module) Publish(ctx context.Context, subject string, data []byte) error {
+func (m *Module) Publish(ctx context.Context, subject string, data []byte, messageID string) (string, error) {
 	m.mu.RLock()
 	js := m.js
 	m.mu.RUnlock()
 	if js == nil {
-		return errors.New("jetstream not ready")
+		return "", errors.New("jetstream not ready")
 	}
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return "", ctx.Err()
 	default:
 	}
 
-	_, err := js.Publish(subject, data)
-	if err != nil {
-		return fmt.Errorf("publish %s: %w", subject, err)
+	msg := &nats.Msg{Subject: subject, Data: data, Header: nats.Header{}}
+	if messageID != "" {
+		msg.Header.Set(nats.MsgIdHdr, messageID)
 	}
-	return nil
+	ack, err := js.PublishMsg(msg)
+	if err != nil {
+		return "", fmt.Errorf("publish %s: %w", subject, err)
+	}
+	return fmt.Sprintf("%s:%d", ack.Stream, ack.Sequence), nil
 }
 
 func (m *Module) Subscribe(ctx context.Context, subject string, handler func(modules.BusMessage)) (func() error, error) {
@@ -124,8 +160,15 @@ func (m *Module) Subscribe(ctx context.Context, subject string, handler func(mod
 	}
 
 	sub, err := nc.Subscribe(subject, func(msg *nats.Msg) {
+		messageID := msg.Header.Get(nats.MsgIdHdr)
+		if messageID == "" {
+			if meta, err := msg.Metadata(); err == nil {
+				messageID = fmt.Sprintf("%s:%d:%d", meta.Stream, meta.Sequence.Stream, meta.Sequence.Consumer)
+			}
+		}
 		handler(modules.BusMessage{
 			Subject:    msg.Subject,
+			MessageID:  messageID,
 			Data:       append([]byte(nil), msg.Data...),
 			ReceivedAt: time.Now().UTC(),
 		})

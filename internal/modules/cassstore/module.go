@@ -2,6 +2,8 @@ package cassstore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -13,18 +15,30 @@ import (
 	"github.com/gocql/gocql"
 
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules"
+	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/security"
 )
 
 type Module struct {
-	hosts    []string
-	keyspace string
+	hosts                 []string
+	keyspace              string
+	user                  string
+	password              string
+	tlsCAFile             string
+	tlsCertFile           string
+	tlsKeyFile            string
+	tlsServerName         string
+	tlsInsecureSkipVerify bool
 
 	mu      sync.RWMutex
 	session *gocql.Session
 }
 
-func New(hosts []string, keyspace string) *Module {
-	return &Module{hosts: hosts, keyspace: keyspace}
+func New(hosts []string, keyspace, user, password, tlsCAFile, tlsCertFile, tlsKeyFile, tlsServerName string, tlsInsecureSkipVerify bool) *Module {
+	return &Module{
+		hosts: hosts, keyspace: keyspace,
+		user: user, password: password,
+		tlsCAFile: tlsCAFile, tlsCertFile: tlsCertFile, tlsKeyFile: tlsKeyFile, tlsServerName: tlsServerName, tlsInsecureSkipVerify: tlsInsecureSkipVerify,
+	}
 }
 
 func (m *Module) Name() string { return "cassstore" }
@@ -36,6 +50,22 @@ func (m *Module) Start(ctx context.Context) error {
 	cluster.Timeout = 8 * time.Second
 	cluster.ConnectTimeout = 8 * time.Second
 	cluster.Consistency = gocql.Quorum
+
+	if m.user != "" {
+		cluster.Authenticator = gocql.PasswordAuthenticator{Username: m.user, Password: m.password}
+	}
+	tlsConfig, err := security.BuildTLSConfig(security.TLSOptions{
+		CAFile: m.tlsCAFile, CertFile: m.tlsCertFile, KeyFile: m.tlsKeyFile, ServerName: m.tlsServerName, InsecureSkipVerify: m.tlsInsecureSkipVerify,
+	})
+	if err != nil {
+		return err
+	}
+	if tlsConfig != nil {
+		cluster.SslOpts = &gocql.SslOptions{
+			Config:                 tlsConfig,
+			EnableHostVerification: !m.tlsInsecureSkipVerify,
+		}
+	}
 
 	bootstrap, err := cluster.CreateSession()
 	if err != nil {
@@ -57,7 +87,8 @@ func (m *Module) Start(ctx context.Context) error {
 		return err
 	}
 
-	tableCQL := `CREATE TABLE IF NOT EXISTS events_by_stream (
+	ddl := []string{
+		`CREATE TABLE IF NOT EXISTS events_by_stream (
 stream text,
 occurred_at timestamp,
 event_id timeuuid,
@@ -65,10 +96,46 @@ subject text,
 event_type text,
 payload text,
 PRIMARY KEY ((stream), occurred_at, event_id)
-) WITH CLUSTERING ORDER BY (occurred_at DESC, event_id DESC)`
-	if err := session.Query(tableCQL).WithContext(ctx).Exec(); err != nil {
-		session.Close()
-		return err
+) WITH CLUSTERING ORDER BY (occurred_at DESC, event_id DESC)`,
+		`CREATE TABLE IF NOT EXISTS events_by_id (
+event_id timeuuid PRIMARY KEY,
+stream text,
+occurred_at timestamp,
+subject text,
+event_type text,
+payload text
+)`,
+		`CREATE TABLE IF NOT EXISTS idempotency_keys (
+stream text,
+idempotency_key text,
+event_id timeuuid,
+payload_hash text,
+created_at timestamp,
+PRIMARY KEY ((stream), idempotency_key)
+)`,
+		`CREATE TABLE IF NOT EXISTS outbox_events (
+event_id timeuuid PRIMARY KEY,
+stream text,
+subject text,
+event_type text,
+payload text,
+occurred_at timestamp,
+publish_state text,
+published_at timestamp,
+broker_message_id text
+)`,
+		`CREATE TABLE IF NOT EXISTS inbox_consumed (
+consumer text,
+message_id text,
+consumed_at timestamp,
+PRIMARY KEY ((consumer), message_id)
+)`,
+	}
+	for _, cql := range ddl {
+		if err := session.Query(cql).WithContext(ctx).Exec(); err != nil {
+			session.Close()
+			return err
+		}
 	}
 
 	m.mu.Lock()
@@ -98,26 +165,103 @@ func (m *Module) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (m *Module) AppendEvent(ctx context.Context, event modules.EventRecord) (string, error) {
+func (m *Module) AppendEventExactlyOnce(ctx context.Context, event modules.EventRecord) (modules.AppendResult, error) {
 	m.mu.RLock()
 	session := m.session
 	m.mu.RUnlock()
 	if session == nil {
-		return "", errors.New("cassandra session not available")
+		return modules.AppendResult{}, errors.New("cassandra session not available")
 	}
-
+	if event.Stream == "" {
+		event.Stream = "default"
+	}
 	if event.OccurredAt.IsZero() {
 		event.OccurredAt = time.Now().UTC()
 	}
-	id := gocql.TimeUUID()
-	err := session.Query(
-		"INSERT INTO events_by_stream (stream, occurred_at, event_id, subject, event_type, payload) VALUES (?, ?, ?, ?, ?, ?)",
-		event.Stream, event.OccurredAt, id, event.Subject, event.Type, event.Payload,
-	).WithContext(ctx).Exec()
-	if err != nil {
-		return "", err
+
+	payloadHash := sha256Hex(event.Payload)
+	newID := gocql.TimeUUID()
+
+	if event.IdempotencyKey != "" {
+		var existingID gocql.UUID
+		applied, err := session.Query(
+			"INSERT INTO idempotency_keys (stream, idempotency_key, event_id, payload_hash, created_at) VALUES (?, ?, ?, ?, ?) IF NOT EXISTS",
+			event.Stream, event.IdempotencyKey, newID, payloadHash, time.Now().UTC(),
+		).WithContext(ctx).ScanCAS(&existingID)
+		if err != nil {
+			return modules.AppendResult{}, err
+		}
+		if !applied {
+			var existing modules.EventRecord
+			var rowID gocql.UUID
+			err := session.Query(
+				"SELECT event_id, stream, occurred_at, subject, event_type, payload FROM events_by_id WHERE event_id = ?",
+				existingID,
+			).WithContext(ctx).Scan(&rowID, &existing.Stream, &existing.OccurredAt, &existing.Subject, &existing.Type, &existing.Payload)
+			if err != nil {
+				return modules.AppendResult{}, err
+			}
+			existing.ID = rowID.String()
+			existing.IdempotencyKey = event.IdempotencyKey
+			published, err := m.isOutboxPublished(ctx, session, existingID)
+			if err != nil {
+				return modules.AppendResult{}, err
+			}
+			return modules.AppendResult{Event: existing, Duplicate: true, Published: published}, nil
+		}
 	}
-	return id.String(), nil
+
+	batch := session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	batch.Query(
+		"INSERT INTO events_by_stream (stream, occurred_at, event_id, subject, event_type, payload) VALUES (?, ?, ?, ?, ?, ?)",
+		event.Stream, event.OccurredAt, newID, event.Subject, event.Type, event.Payload,
+	)
+	batch.Query(
+		"INSERT INTO events_by_id (event_id, stream, occurred_at, subject, event_type, payload) VALUES (?, ?, ?, ?, ?, ?)",
+		newID, event.Stream, event.OccurredAt, event.Subject, event.Type, event.Payload,
+	)
+	batch.Query(
+		"INSERT INTO outbox_events (event_id, stream, subject, event_type, payload, occurred_at, publish_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		newID, event.Stream, event.Subject, event.Type, event.Payload, event.OccurredAt, "pending",
+	)
+	if err := session.ExecuteBatch(batch); err != nil {
+		return modules.AppendResult{}, err
+	}
+
+	event.ID = newID.String()
+	return modules.AppendResult{Event: event, Duplicate: false, Published: false}, nil
+}
+
+func (m *Module) MarkOutboxPublished(ctx context.Context, eventID string, brokerMessageID string) error {
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return errors.New("cassandra session not available")
+	}
+	id, err := gocql.ParseUUID(eventID)
+	if err != nil {
+		return err
+	}
+	return session.Query(
+		"UPDATE outbox_events SET publish_state = ?, published_at = ?, broker_message_id = ? WHERE event_id = ?",
+		"published", time.Now().UTC(), brokerMessageID, id,
+	).WithContext(ctx).Exec()
+}
+
+func (m *Module) ClaimInboxMessage(ctx context.Context, consumer string, messageID string) (bool, error) {
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return false, errors.New("cassandra session not available")
+	}
+	var consumedAt time.Time
+	applied, err := session.Query(
+		"INSERT INTO inbox_consumed (consumer, message_id, consumed_at) VALUES (?, ?, ?) IF NOT EXISTS",
+		consumer, messageID, time.Now().UTC(),
+	).WithContext(ctx).ScanCAS(&consumedAt)
+	return applied, err
 }
 
 func (m *Module) RecentEvents(ctx context.Context, stream string, limit int) ([]modules.EventRecord, error) {
@@ -138,8 +282,6 @@ func (m *Module) RecentEvents(ctx context.Context, stream string, limit int) ([]
 		"SELECT event_id, occurred_at, subject, event_type, payload FROM events_by_stream WHERE stream = ? LIMIT ?",
 		stream, limit,
 	).WithContext(ctx).Iter()
-	defer iter.Close()
-
 	events := make([]modules.EventRecord, 0, limit)
 	var (
 		id         gocql.UUID
@@ -162,6 +304,20 @@ func (m *Module) RecentEvents(ctx context.Context, stream string, limit int) ([]
 		return nil, err
 	}
 	return events, nil
+}
+
+func (m *Module) isOutboxPublished(ctx context.Context, session *gocql.Session, eventID gocql.UUID) (bool, error) {
+	var state string
+	err := session.Query("SELECT publish_state FROM outbox_events WHERE event_id = ?", eventID).WithContext(ctx).Scan(&state)
+	if err != nil {
+		return false, err
+	}
+	return state == "published", nil
+}
+
+func sha256Hex(data string) string {
+	sum := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(sum[:])
 }
 
 func normalizeHosts(in []string) ([]string, int) {

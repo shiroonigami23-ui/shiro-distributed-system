@@ -20,9 +20,9 @@ func main() {
 	cfg := config.FromEnv()
 
 	app := core.New(cfg,
-		natsbus.New(cfg.NATSURL, cfg.NATSStream),
-		etcdcoord.New(cfg.NodeID, cfg.EtcdEndpoints, cfg.LeaderElectionKey),
-		cassstore.New(cfg.CassandraHosts, cfg.CassandraKeyspace),
+		natsbus.New(cfg.NATSURL, cfg.NATSStream, cfg.NATSUser, cfg.NATSPassword, cfg.NATSToken, cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSServerName, cfg.TLSInsecureSkipVerify),
+		etcdcoord.New(cfg.NodeID, cfg.EtcdEndpoints, cfg.LeaderElectionKey, cfg.EtcdUser, cfg.EtcdPassword, cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSServerName, cfg.TLSInsecureSkipVerify),
+		cassstore.New(cfg.CassandraHosts, cfg.CassandraKeyspace, cfg.CassandraUser, cfg.CassandraPassword, cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSServerName, cfg.TLSInsecureSkipVerify),
 	)
 
 	if err := app.Run(ctx); err != nil {

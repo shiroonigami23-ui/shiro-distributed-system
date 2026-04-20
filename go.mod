@@ -5,10 +5,13 @@ go 1.25.0
 require (
 	github.com/gocql/gocql v1.7.0
 	github.com/nats-io/nats.go v1.51.0
+	github.com/prometheus/client_golang v1.20.5
 	go.etcd.io/etcd/client/v3 v3.6.10
 )
 
 require (
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
@@ -17,8 +20,12 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3 // indirect
 	github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
+	github.com/prometheus/client_model v0.6.1 // indirect
+	github.com/prometheus/common v0.62.0 // indirect
+	github.com/prometheus/procfs v0.15.1 // indirect
 	go.etcd.io/etcd/api/v3 v3.6.10 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.6.10 // indirect
 	go.uber.org/multierr v1.11.0 // indirect

@@ -8,7 +8,12 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/config"
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules"
@@ -21,13 +26,17 @@ type App struct {
 	bus   modules.EventBus
 	coord modules.Coordinator
 	store modules.EventStore
+
+	reqs *prometheus.CounterVec
+	lat  *prometheus.HistogramVec
 }
 
 type publishRequest struct {
-	Stream  string          `json:"stream"`
-	Subject string          `json:"subject"`
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
+	Stream         string          `json:"stream"`
+	Subject        string          `json:"subject"`
+	Type           string          `json:"type"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Payload        json.RawMessage `json:"payload"`
 }
 
 func New(cfg config.Config, ms ...modules.Module) *App {
@@ -43,6 +52,15 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 			a.store = store
 		}
 	}
+	a.reqs = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shiro_http_requests_total",
+		Help: "Total HTTP requests grouped by path and method",
+	}, []string{"path", "method", "status"})
+	a.lat = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "shiro_http_request_duration_seconds",
+		Help:    "HTTP request duration seconds grouped by path and method",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"path", "method"})
 	return a
 }
 
@@ -55,12 +73,16 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", a.handleHealth)
-	mux.HandleFunc("/leaderz", a.handleLeader)
-	mux.HandleFunc("/events", a.handleEvents)
-	mux.HandleFunc("/stream", a.handleStream)
+	mux.Handle("/leaderz", a.secure("admin", http.HandlerFunc(a.handleLeader)))
+	mux.Handle("/events", a.secure("rw", http.HandlerFunc(a.handleEvents)))
+	mux.Handle("/stream", a.secure("read", http.HandlerFunc(a.handleStream)))
 
-	srv := &http.Server{Addr: a.cfg.HTTPAddr, Handler: mux}
+	srv := &http.Server{
+		Addr:    a.cfg.HTTPAddr,
+		Handler: a.instrument(mux),
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -87,6 +109,54 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (a *App) secure(scope string, next http.Handler) http.Handler {
+	if a.cfg.DisableAPITokenAuth {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := bearerToken(r.Header.Get("Authorization"))
+		if token == "" && a.cfg.APIBearerToken == "" && len(a.cfg.APIAdminTokens) == 0 && len(a.cfg.APIPublishTokens) == 0 && len(a.cfg.APIReadTokens) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if token == "" {
+			http.Error(w, "missing bearer token", http.StatusUnauthorized)
+			return
+		}
+		if a.cfg.APIBearerToken != "" && token == a.cfg.APIBearerToken {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		allowed := false
+		switch scope {
+		case "admin":
+			allowed = contains(a.cfg.APIAdminTokens, token)
+		case "read":
+			allowed = contains(a.cfg.APIReadTokens, token) || contains(a.cfg.APIAdminTokens, token)
+		case "rw":
+			allowed = contains(a.cfg.APIPublishTokens, token) || contains(a.cfg.APIReadTokens, token) || contains(a.cfg.APIAdminTokens, token)
+		}
+		if !allowed {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) instrument(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		path := r.URL.Path
+		a.reqs.WithLabelValues(path, r.Method, strconv.Itoa(rec.status)).Inc()
+		a.lat.WithLabelValues(path, r.Method).Observe(time.Since(start).Seconds())
+	})
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -146,36 +216,52 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "event"
 	}
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = r.Header.Get("Idempotency-Key")
+	}
 	if len(req.Payload) == 0 {
 		req.Payload = json.RawMessage(`{}`)
 	}
 
 	event := modules.EventRecord{
-		Stream:     req.Stream,
-		Subject:    req.Subject,
-		Type:       req.Type,
-		Payload:    string(req.Payload),
-		OccurredAt: time.Now().UTC(),
+		IdempotencyKey: req.IdempotencyKey,
+		Stream:         req.Stream,
+		Subject:        req.Subject,
+		Type:           req.Type,
+		Payload:        string(req.Payload),
+		OccurredAt:     time.Now().UTC(),
 	}
 
-	id, err := a.store.AppendEvent(r.Context(), event)
+	result, err := a.store.AppendEventExactlyOnce(r.Context(), event)
 	if err != nil {
 		http.Error(w, "store error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	event.ID = id
 
-	if err := a.bus.Publish(r.Context(), event.Subject, []byte(event.Payload)); err != nil {
-		http.Error(w, "publish error: "+err.Error(), http.StatusInternalServerError)
-		return
+	if !result.Published {
+		brokerID, err := a.bus.Publish(r.Context(), result.Event.Subject, []byte(result.Event.Payload), result.Event.ID)
+		if err != nil {
+			http.Error(w, "publish error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := a.store.MarkOutboxPublished(r.Context(), result.Event.ID, brokerID); err != nil {
+			http.Error(w, "outbox update error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":         event.ID,
-		"stream":     event.Stream,
-		"subject":    event.Subject,
-		"type":       event.Type,
-		"occurredAt": event.OccurredAt,
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{
+		"id":             result.Event.ID,
+		"stream":         result.Event.Stream,
+		"subject":        result.Event.Subject,
+		"type":           result.Event.Type,
+		"occurredAt":     result.Event.OccurredAt,
+		"idempotencyKey": result.Event.IdempotencyKey,
+		"duplicate":      result.Duplicate,
 	})
 }
 
@@ -218,6 +304,10 @@ func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
 	if subject == "" {
 		subject = "events.>"
 	}
+	consumer := r.URL.Query().Get("consumer")
+	if consumer == "" {
+		consumer = "sse:" + a.cfg.NodeID
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -247,10 +337,17 @@ func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case msg := <-ch:
+			if a.store != nil && msg.MessageID != "" {
+				ok, err := a.store.ClaimInboxMessage(r.Context(), consumer, msg.MessageID)
+				if err != nil || !ok {
+					continue
+				}
+			}
 			body := map[string]any{
-				"subject": msg.Subject,
-				"data":    string(msg.Data),
-				"ts":      msg.ReceivedAt,
+				"subject":   msg.Subject,
+				"messageId": msg.MessageID,
+				"data":      string(msg.Data),
+				"ts":        msg.ReceivedAt,
 			}
 			raw, _ := json.Marshal(body)
 			_, _ = w.Write([]byte("event: message\n"))
@@ -258,6 +355,35 @@ func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func bearerToken(h string) string {
+	if h == "" {
+		return ""
+	}
+	if !strings.HasPrefix(strings.ToLower(h), "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(h[7:])
+}
+
+func contains(list []string, value string) bool {
+	for _, v := range list {
+		if strings.TrimSpace(v) == value {
+			return true
+		}
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
