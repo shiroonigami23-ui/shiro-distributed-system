@@ -48,6 +48,7 @@ type Coordinator interface {
 type EventStore interface {
 	AppendEventExactlyOnce(ctx context.Context, event EventRecord) (AppendResult, error)
 	MarkOutboxPublished(ctx context.Context, eventID string, brokerMessageID string) error
+	PendingOutboxEvents(ctx context.Context, limit int) ([]EventRecord, error)
 	ClaimInboxMessage(ctx context.Context, consumer string, messageID string) (bool, error)
 	RecentEvents(ctx context.Context, stream string, limit int) ([]EventRecord, error)
 }

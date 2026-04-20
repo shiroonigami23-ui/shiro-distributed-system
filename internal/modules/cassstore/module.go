@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/gocql/gocql"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules"
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/security"
@@ -31,6 +34,7 @@ type Module struct {
 
 	mu      sync.RWMutex
 	session *gocql.Session
+	tracer  trace.Tracer
 }
 
 func New(hosts []string, keyspace, user, password, tlsCAFile, tlsCertFile, tlsKeyFile, tlsServerName string, tlsInsecureSkipVerify bool) *Module {
@@ -38,6 +42,7 @@ func New(hosts []string, keyspace, user, password, tlsCAFile, tlsCertFile, tlsKe
 		hosts: hosts, keyspace: keyspace,
 		user: user, password: password,
 		tlsCAFile: tlsCAFile, tlsCertFile: tlsCertFile, tlsKeyFile: tlsKeyFile, tlsServerName: tlsServerName, tlsInsecureSkipVerify: tlsInsecureSkipVerify,
+		tracer: otel.Tracer("shiro.cassstore"),
 	}
 }
 
@@ -124,6 +129,16 @@ publish_state text,
 published_at timestamp,
 broker_message_id text
 )`,
+		`CREATE TABLE IF NOT EXISTS outbox_by_state (
+publish_state text,
+occurred_at timestamp,
+event_id timeuuid,
+stream text,
+subject text,
+event_type text,
+payload text,
+PRIMARY KEY ((publish_state), occurred_at, event_id)
+) WITH CLUSTERING ORDER BY (occurred_at ASC, event_id ASC)`,
 		`CREATE TABLE IF NOT EXISTS inbox_consumed (
 consumer text,
 message_id text,
@@ -166,6 +181,12 @@ func (m *Module) Stop(ctx context.Context) error {
 }
 
 func (m *Module) AppendEventExactlyOnce(ctx context.Context, event modules.EventRecord) (modules.AppendResult, error) {
+	ctx, span := m.tracer.Start(ctx, "cass.appendEvent", trace.WithAttributes(
+		attribute.String("db.system", "cassandra"),
+		attribute.String("event.stream", event.Stream),
+	))
+	defer span.End()
+
 	m.mu.RLock()
 	session := m.session
 	m.mu.RUnlock()
@@ -224,15 +245,26 @@ func (m *Module) AppendEventExactlyOnce(ctx context.Context, event modules.Event
 		"INSERT INTO outbox_events (event_id, stream, subject, event_type, payload, occurred_at, publish_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		newID, event.Stream, event.Subject, event.Type, event.Payload, event.OccurredAt, "pending",
 	)
+	batch.Query(
+		"INSERT INTO outbox_by_state (publish_state, occurred_at, event_id, stream, subject, event_type, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"pending", event.OccurredAt, newID, event.Stream, event.Subject, event.Type, event.Payload,
+	)
 	if err := session.ExecuteBatch(batch); err != nil {
 		return modules.AppendResult{}, err
 	}
 
 	event.ID = newID.String()
+	span.SetAttributes(attribute.String("event.id", event.ID))
 	return modules.AppendResult{Event: event, Duplicate: false, Published: false}, nil
 }
 
 func (m *Module) MarkOutboxPublished(ctx context.Context, eventID string, brokerMessageID string) error {
+	ctx, span := m.tracer.Start(ctx, "cass.markOutboxPublished", trace.WithAttributes(
+		attribute.String("db.system", "cassandra"),
+		attribute.String("event.id", eventID),
+	))
+	defer span.End()
+
 	m.mu.RLock()
 	session := m.session
 	m.mu.RUnlock()
@@ -243,13 +275,87 @@ func (m *Module) MarkOutboxPublished(ctx context.Context, eventID string, broker
 	if err != nil {
 		return err
 	}
-	return session.Query(
+	var occurredAt time.Time
+	var stream, subject, eventType, payload string
+	err = session.Query(
+		"SELECT occurred_at, stream, subject, event_type, payload FROM outbox_events WHERE event_id = ?",
+		id,
+	).WithContext(ctx).Scan(&occurredAt, &stream, &subject, &eventType, &payload)
+	if err != nil {
+		return err
+	}
+
+	batch := session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	batch.Query(
 		"UPDATE outbox_events SET publish_state = ?, published_at = ?, broker_message_id = ? WHERE event_id = ?",
 		"published", time.Now().UTC(), brokerMessageID, id,
-	).WithContext(ctx).Exec()
+	)
+	batch.Query(
+		"DELETE FROM outbox_by_state WHERE publish_state = ? AND occurred_at = ? AND event_id = ?",
+		"pending", occurredAt, id,
+	)
+	return session.ExecuteBatch(batch)
+}
+
+func (m *Module) PendingOutboxEvents(ctx context.Context, limit int) ([]modules.EventRecord, error) {
+	ctx, span := m.tracer.Start(ctx, "cass.pendingOutbox", trace.WithAttributes(
+		attribute.String("db.system", "cassandra"),
+		attribute.Int("outbox.limit", limit),
+	))
+	defer span.End()
+
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return nil, errors.New("cassandra session not available")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	iter := session.Query(
+		"SELECT occurred_at, event_id, stream, subject, event_type, payload FROM outbox_by_state WHERE publish_state = ? LIMIT ?",
+		"pending", limit,
+	).WithContext(ctx).Iter()
+
+	out := make([]modules.EventRecord, 0, limit)
+	var (
+		occurredAt time.Time
+		id         gocql.UUID
+		stream     string
+		subject    string
+		eventType  string
+		payload    string
+	)
+	for iter.Scan(&occurredAt, &id, &stream, &subject, &eventType, &payload) {
+		out = append(out, modules.EventRecord{
+			ID:         id.String(),
+			Stream:     stream,
+			Subject:    subject,
+			Type:       eventType,
+			Payload:    payload,
+			OccurredAt: occurredAt.UTC(),
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	span.SetAttributes(attribute.Int("outbox.pending_count", len(out)))
+	return out, nil
 }
 
 func (m *Module) ClaimInboxMessage(ctx context.Context, consumer string, messageID string) (bool, error) {
+	ctx, span := m.tracer.Start(ctx, "cass.claimInboxMessage", trace.WithAttributes(
+		attribute.String("db.system", "cassandra"),
+		attribute.String("consumer", consumer),
+		attribute.String("message.id", messageID),
+	))
+	defer span.End()
+
 	m.mu.RLock()
 	session := m.session
 	m.mu.RUnlock()
@@ -261,10 +367,18 @@ func (m *Module) ClaimInboxMessage(ctx context.Context, consumer string, message
 		"INSERT INTO inbox_consumed (consumer, message_id, consumed_at) VALUES (?, ?, ?) IF NOT EXISTS",
 		consumer, messageID, time.Now().UTC(),
 	).WithContext(ctx).ScanCAS(&consumedAt)
+	span.SetAttributes(attribute.Bool("inbox.applied", applied))
 	return applied, err
 }
 
 func (m *Module) RecentEvents(ctx context.Context, stream string, limit int) ([]modules.EventRecord, error) {
+	ctx, span := m.tracer.Start(ctx, "cass.recentEvents", trace.WithAttributes(
+		attribute.String("db.system", "cassandra"),
+		attribute.String("event.stream", stream),
+		attribute.Int("query.limit", limit),
+	))
+	defer span.End()
+
 	m.mu.RLock()
 	session := m.session
 	m.mu.RUnlock()
@@ -303,6 +417,7 @@ func (m *Module) RecentEvents(ctx context.Context, stream string, limit int) ([]
 	if err := iter.Close(); err != nil {
 		return nil, err
 	}
+	span.SetAttributes(attribute.Int("query.count", len(events)))
 	return events, nil
 }
 

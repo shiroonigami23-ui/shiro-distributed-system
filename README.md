@@ -21,10 +21,13 @@ A production-grade distributed-system control plane focused on secure coordinati
 - Real etcd leader election
 - Real Cassandra durable event store
 - Exactly-once/idempotent publish flow (idempotency key + outbox state)
+- Background outbox relay worker for eventual publish after restart/failure
 - Inbox de-dup for consumers
 - API auth + ACL enforcement
 - Shared mTLS support across module connections
 - Configurable publish retry/backoff with dead-letter fallback
+- OpenTelemetry tracing (HTTP + NATS + Cassandra spans)
+- Rate limiting, request size limits, and structured audit logs
 - Prometheus metrics endpoint `/metrics`
 - Kubernetes deployment + HPA + ServiceMonitor manifests
 - CI workflow for formatting/build/test gates

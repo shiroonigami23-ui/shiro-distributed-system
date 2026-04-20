@@ -35,6 +35,14 @@ type Config struct {
 	PublishRetryMax          int
 	PublishRetryBackoffMs    int
 	PublishRetryMaxBackoffMs int
+	OutboxRelayIntervalMs    int
+	OutboxRelayBatchSize     int
+	RateLimitRPS             int
+	RateLimitBurst           int
+	MaxRequestBodyBytes      int64
+	AuditLogEnabled          bool
+	OTELServiceName          string
+	OTELExporterOTLPEndpoint string
 }
 
 func FromEnv() Config {
@@ -67,6 +75,14 @@ func FromEnv() Config {
 		PublishRetryMax:          intOr("PUBLISH_RETRY_MAX", 4),
 		PublishRetryBackoffMs:    intOr("PUBLISH_RETRY_BACKOFF_MS", 150),
 		PublishRetryMaxBackoffMs: intOr("PUBLISH_RETRY_MAX_BACKOFF_MS", 3000),
+		OutboxRelayIntervalMs:    intOr("OUTBOX_RELAY_INTERVAL_MS", 1500),
+		OutboxRelayBatchSize:     intOr("OUTBOX_RELAY_BATCH_SIZE", 100),
+		RateLimitRPS:             intOr("RATE_LIMIT_RPS", 60),
+		RateLimitBurst:           intOr("RATE_LIMIT_BURST", 120),
+		MaxRequestBodyBytes:      int64Or("MAX_REQUEST_BODY_BYTES", 1<<20),
+		AuditLogEnabled:          boolOr("AUDIT_LOG_ENABLED", true),
+		OTELServiceName:          envOr("OTEL_SERVICE_NAME", "shiro-distributed-system"),
+		OTELExporterOTLPEndpoint: envOr("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
 }
 
@@ -111,6 +127,18 @@ func intOr(key string, fallback int) int {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func int64Or(key string, fallback int64) int64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
 		return fallback
 	}

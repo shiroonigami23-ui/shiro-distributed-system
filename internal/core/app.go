@@ -7,13 +7,20 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/time/rate"
 
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/config"
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules"
@@ -31,6 +38,8 @@ type App struct {
 	lat         *prometheus.HistogramVec
 	pubRetries  prometheus.Counter
 	pubFailures prometheus.Counter
+	tracer      trace.Tracer
+	limiter     *ipRateLimiter
 }
 
 type publishRequest struct {
@@ -71,6 +80,8 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 		Name: "shiro_publish_failures_total",
 		Help: "Total publish failures after retries",
 	})
+	a.tracer = otel.Tracer("shiro.core")
+	a.limiter = newIPRateLimiter(rate.Limit(max(1, cfg.RateLimitRPS)), max(1, cfg.RateLimitBurst))
 	return a
 }
 
@@ -89,9 +100,13 @@ func (a *App) Run(ctx context.Context) error {
 	mux.Handle("/events", a.secure("rw", http.HandlerFunc(a.handleEvents)))
 	mux.Handle("/stream", a.secure("read", http.HandlerFunc(a.handleStream)))
 
+	if a.store != nil && a.bus != nil {
+		go a.runOutboxRelay(ctx)
+	}
+
 	srv := &http.Server{
 		Addr:    a.cfg.HTTPAddr,
-		Handler: a.instrument(mux),
+		Handler: a.withRateLimit(a.instrument(mux)),
 	}
 
 	errCh := make(chan error, 1)
@@ -160,12 +175,36 @@ func (a *App) secure(scope string, next http.Handler) http.Handler {
 
 func (a *App) instrument(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, span := appTracer(a).Start(r.Context(), "http "+r.Method+" "+r.URL.Path, trace.WithAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.path", r.URL.Path),
+		))
+		defer span.End()
+
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
+		next.ServeHTTP(rec, r.WithContext(ctx))
 		path := r.URL.Path
 		a.reqs.WithLabelValues(path, r.Method, strconv.Itoa(rec.status)).Inc()
 		a.lat.WithLabelValues(path, r.Method).Observe(time.Since(start).Seconds())
+		span.SetAttributes(attribute.Int("http.status_code", rec.status))
+		if rec.status >= 500 {
+			span.SetStatus(codes.Error, "server error")
+		}
+		if a.cfg.AuditLogEnabled {
+			log.Printf("audit method=%s path=%s status=%d duration_ms=%d remote=%s", r.Method, r.URL.Path, rec.status, time.Since(start).Milliseconds(), r.RemoteAddr)
+		}
+	})
+}
+
+func (a *App) withRateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r.RemoteAddr)
+		if !a.limiter.Allow(ip) {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -212,6 +251,7 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxRequestBodyBytes)
 	var req publishRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
@@ -368,6 +408,12 @@ func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) publishWithRetry(ctx context.Context, subject string, payload []byte, messageID string) (string, error) {
+	ctx, span := appTracer(a).Start(ctx, "publishWithRetry", trace.WithAttributes(
+		attribute.String("messaging.destination", subject),
+		attribute.String("messaging.message_id", messageID),
+	))
+	defer span.End()
+
 	attempts := a.cfg.PublishRetryMax
 	if attempts <= 0 {
 		attempts = 1
@@ -386,6 +432,7 @@ func (a *App) publishWithRetry(ctx context.Context, subject string, payload []by
 	for attempt := 1; attempt <= attempts; attempt++ {
 		id, err := a.bus.Publish(ctx, subject, payload, messageID)
 		if err == nil {
+			span.SetAttributes(attribute.Int("publish.attempt", attempt))
 			return id, nil
 		}
 		lastErr = err
@@ -399,6 +446,7 @@ func (a *App) publishWithRetry(ctx context.Context, subject string, payload []by
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			span.RecordError(ctx.Err())
 			return "", ctx.Err()
 		case <-timer.C:
 		}
@@ -426,7 +474,54 @@ func (a *App) publishWithRetry(ctx context.Context, subject string, payload []by
 	if raw, err := json.Marshal(dlqMsg); err == nil {
 		_, _ = a.bus.Publish(context.Background(), dlq, raw, messageID+"-dlq")
 	}
+	span.RecordError(lastErr)
+	span.SetStatus(codes.Error, "publish failed")
 	return "", lastErr
+}
+
+func (a *App) runOutboxRelay(ctx context.Context) {
+	interval := time.Duration(max(250, a.cfg.OutboxRelayIntervalMs)) * time.Millisecond
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if a.coord != nil && !a.coord.IsLeader() {
+				continue
+			}
+			rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			_ = a.relayOutboxBatch(rctx)
+			cancel()
+		}
+	}
+}
+
+func (a *App) relayOutboxBatch(ctx context.Context) error {
+	if a.store == nil || a.bus == nil {
+		return nil
+	}
+	ctx, span := appTracer(a).Start(ctx, "relayOutboxBatch")
+	defer span.End()
+
+	batchSize := max(1, a.cfg.OutboxRelayBatchSize)
+	pending, err := a.store.PendingOutboxEvents(ctx, batchSize)
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	span.SetAttributes(attribute.Int("outbox.pending", len(pending)))
+	for _, evt := range pending {
+		brokerID, err := a.publishWithRetry(ctx, evt.Subject, []byte(evt.Payload), evt.ID)
+		if err != nil {
+			continue
+		}
+		if err := a.store.MarkOutboxPublished(ctx, evt.ID, brokerID); err != nil {
+			span.RecordError(err)
+		}
+	}
+	return nil
 }
 
 type statusRecorder struct {
@@ -462,4 +557,56 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+type ipRateLimiter struct {
+	r    rate.Limit
+	b    int
+	mu   sync.Mutex
+	data map[string]*rate.Limiter
+}
+
+func newIPRateLimiter(r rate.Limit, b int) *ipRateLimiter {
+	return &ipRateLimiter{
+		r:    r,
+		b:    b,
+		data: make(map[string]*rate.Limiter),
+	}
+}
+
+func (l *ipRateLimiter) Allow(ip string) bool {
+	l.mu.Lock()
+	lim, ok := l.data[ip]
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.b)
+		l.data[ip] = lim
+	}
+	l.mu.Unlock()
+	return lim.Allow()
+}
+
+func clientIP(remoteAddr string) string {
+	addrPort, err := netip.ParseAddrPort(remoteAddr)
+	if err == nil {
+		return addrPort.Addr().String()
+	}
+	parts := strings.Split(remoteAddr, ":")
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return remoteAddr
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func appTracer(a *App) trace.Tracer {
+	if a != nil && a.tracer != nil {
+		return a.tracer
+	}
+	return otel.Tracer("shiro.core")
 }

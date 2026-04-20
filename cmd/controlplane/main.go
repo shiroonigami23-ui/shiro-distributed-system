@@ -11,6 +11,7 @@ import (
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules/cassstore"
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules/etcdcoord"
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules/natsbus"
+	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/telemetry"
 )
 
 func main() {
@@ -18,6 +19,13 @@ func main() {
 	defer stop()
 
 	cfg := config.FromEnv()
+	shutdownOtel, err := telemetry.Setup(ctx, cfg.OTELServiceName, cfg.OTELExporterOTLPEndpoint)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		_ = shutdownOtel(context.Background())
+	}()
 
 	app := core.New(cfg,
 		natsbus.New(cfg.NATSURL, cfg.NATSStream, cfg.NATSUser, cfg.NATSPassword, cfg.NATSToken, cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSServerName, cfg.TLSInsecureSkipVerify),
