@@ -20,8 +20,8 @@ func main() {
 	cfg := config.FromEnv()
 
 	app := core.New(cfg,
-		natsbus.New(cfg.NATSURL),
-		etcdcoord.New(cfg.EtcdEndpoints),
+		natsbus.New(cfg.NATSURL, cfg.NATSStream),
+		etcdcoord.New(cfg.NodeID, cfg.EtcdEndpoints, cfg.LeaderElectionKey),
 		cassstore.New(cfg.CassandraHosts, cfg.CassandraKeyspace),
 	)
 
