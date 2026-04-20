@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://go.dev/"><img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=for-the-badge&logo=go&logoColor=white"></a>
+  <img alt="License" src="https://img.shields.io/badge/License-Apache--2.0-111111?style=for-the-badge">
   <img alt="Architecture" src="https://img.shields.io/badge/Architecture-Modular-0A66C2?style=for-the-badge&logo=dependabot&logoColor=white">
   <img alt="Messaging" src="https://img.shields.io/badge/NATS-JetStream-27AE60?style=for-the-badge">
   <img alt="Coordination" src="https://img.shields.io/badge/etcd-Leader%20Election-34495E?style=for-the-badge">
@@ -13,7 +14,7 @@
   <img alt="API" src="https://img.shields.io/badge/API-REST%20%2B%20SSE-8E44AD?style=for-the-badge">
 </p>
 
-A distributed-system control plane with production-first patterns built in.
+A production-grade distributed-system control plane focused on secure coordination, reliable eventing, and durable state.
 
 ## Core Features
 - Real NATS + JetStream event transport
@@ -84,9 +85,3 @@ K8s manifests live in `deploy/k8s` with deployment, service, autoscaling and Ser
   <img src="assets/images/internet-map.jpg" alt="Internet map" width="48%" />
   <img src="assets/images/data-center.jpg" alt="Data center" width="48%" />
 </p>
-
-## Image Credits
-These images are from Wikimedia Commons and should follow their original licenses:
-- Cloud computing layers: https://commons.wikimedia.org/wiki/File:Cloud_computing_layers.png
-- Data center: https://commons.wikimedia.org/wiki/File:Data_Center.jpg
-- Internet map: https://commons.wikimedia.org/wiki/File:Internet_map_1024.jpg
