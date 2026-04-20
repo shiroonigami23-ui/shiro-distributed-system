@@ -10,5 +10,8 @@ kubectl apply -f deploy/k8s/11-secret.yaml
 kubectl apply -f deploy/k8s/20-deployment.yaml
 kubectl apply -f deploy/k8s/30-service.yaml
 kubectl apply -f deploy/k8s/40-hpa.yaml
+kubectl apply -f deploy/k8s/45-pdb.yaml
 kubectl apply -f deploy/k8s/50-servicemonitor.yaml
+kubectl apply -f deploy/k8s/60-ingress.yaml
+kubectl apply -f deploy/k8s/70-networkpolicy.yaml
 ```

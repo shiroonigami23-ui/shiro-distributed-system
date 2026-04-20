@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shirods-controlplane
+  namespace: shirods
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: shirods.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shirods-controlplane
+                port:
+                  number: 80

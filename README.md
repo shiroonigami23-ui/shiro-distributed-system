@@ -24,8 +24,10 @@ A production-grade distributed-system control plane focused on secure coordinati
 - Inbox de-dup for consumers
 - API auth + ACL enforcement
 - Shared mTLS support across module connections
+- Configurable publish retry/backoff with dead-letter fallback
 - Prometheus metrics endpoint `/metrics`
 - Kubernetes deployment + HPA + ServiceMonitor manifests
+- CI workflow for formatting/build/test gates
 
 ## API Endpoints
 - `GET /healthz` readiness status
@@ -66,6 +68,14 @@ Shared TLS options:
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
 go run ./cmd/controlplane
+```
+
+## Developer Commands
+```bash
+make test
+make build
+make run
+make docker-build
 ```
 
 ## Publish Example

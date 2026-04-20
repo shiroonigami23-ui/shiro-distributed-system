@@ -1,4 +1,8 @@
-# cmd\controlplane
+# cmd/controlplane
 
-Folder documentation for this project area.
+Entrypoint binary for the control-plane server.
 
+Build:
+```bash
+go build ./cmd/controlplane
+```

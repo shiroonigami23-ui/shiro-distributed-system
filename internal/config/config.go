@@ -2,64 +2,71 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
 type Config struct {
-	HTTPAddr              string
-	NodeID                string
-	NATSURL               string
-	NATSStream            string
-	NATSUser              string
-	NATSPassword          string
-	NATSToken             string
-	EtcdEndpoints         []string
-	EtcdUser              string
-	EtcdPassword          string
-	LeaderElectionKey     string
-	CassandraHosts        []string
-	CassandraKeyspace     string
-	CassandraUser         string
-	CassandraPassword     string
-	TLSCAFile             string
-	TLSCertFile           string
-	TLSKeyFile            string
-	TLSServerName         string
-	TLSInsecureSkipVerify bool
-	APIBearerToken        string
-	APIPublishTokens      []string
-	APIReadTokens         []string
-	APIAdminTokens        []string
-	DisableAPITokenAuth   bool
+	HTTPAddr                 string
+	NodeID                   string
+	NATSURL                  string
+	NATSStream               string
+	NATSUser                 string
+	NATSPassword             string
+	NATSToken                string
+	EtcdEndpoints            []string
+	EtcdUser                 string
+	EtcdPassword             string
+	LeaderElectionKey        string
+	CassandraHosts           []string
+	CassandraKeyspace        string
+	CassandraUser            string
+	CassandraPassword        string
+	TLSCAFile                string
+	TLSCertFile              string
+	TLSKeyFile               string
+	TLSServerName            string
+	TLSInsecureSkipVerify    bool
+	APIBearerToken           string
+	APIPublishTokens         []string
+	APIReadTokens            []string
+	APIAdminTokens           []string
+	DisableAPITokenAuth      bool
+	PublishRetryMax          int
+	PublishRetryBackoffMs    int
+	PublishRetryMaxBackoffMs int
 }
 
 func FromEnv() Config {
 	return Config{
-		HTTPAddr:              envOr("HTTP_ADDR", ":8080"),
-		NodeID:                envOr("NODE_ID", hostOr("node-1")),
-		NATSURL:               envOr("NATS_URL", "nats://localhost:4222"),
-		NATSStream:            envOr("NATS_STREAM", "SHIRO_EVENTS"),
-		NATSUser:              envOr("NATS_USER", ""),
-		NATSPassword:          envOr("NATS_PASSWORD", ""),
-		NATSToken:             envOr("NATS_TOKEN", ""),
-		EtcdEndpoints:         splitOr("ETCD_ENDPOINTS", "localhost:2379"),
-		EtcdUser:              envOr("ETCD_USER", ""),
-		EtcdPassword:          envOr("ETCD_PASSWORD", ""),
-		LeaderElectionKey:     envOr("LEADER_ELECTION_KEY", "/shirods/controlplane/leader"),
-		CassandraHosts:        splitOr("CASSANDRA_HOSTS", "localhost:9042"),
-		CassandraKeyspace:     envOr("CASSANDRA_KEYSPACE", "shirods"),
-		CassandraUser:         envOr("CASSANDRA_USER", ""),
-		CassandraPassword:     envOr("CASSANDRA_PASSWORD", ""),
-		TLSCAFile:             envOr("TLS_CA_FILE", ""),
-		TLSCertFile:           envOr("TLS_CERT_FILE", ""),
-		TLSKeyFile:            envOr("TLS_KEY_FILE", ""),
-		TLSServerName:         envOr("TLS_SERVER_NAME", ""),
-		TLSInsecureSkipVerify: boolOr("TLS_INSECURE_SKIP_VERIFY", false),
-		APIBearerToken:        envOr("API_BEARER_TOKEN", ""),
-		APIPublishTokens:      splitOr("API_ACL_PUBLISH_TOKENS", ""),
-		APIReadTokens:         splitOr("API_ACL_READ_TOKENS", ""),
-		APIAdminTokens:        splitOr("API_ACL_ADMIN_TOKENS", ""),
-		DisableAPITokenAuth:   boolOr("DISABLE_API_TOKEN_AUTH", false),
+		HTTPAddr:                 envOr("HTTP_ADDR", ":8080"),
+		NodeID:                   envOr("NODE_ID", hostOr("node-1")),
+		NATSURL:                  envOr("NATS_URL", "nats://localhost:4222"),
+		NATSStream:               envOr("NATS_STREAM", "SHIRO_EVENTS"),
+		NATSUser:                 envOr("NATS_USER", ""),
+		NATSPassword:             envOr("NATS_PASSWORD", ""),
+		NATSToken:                envOr("NATS_TOKEN", ""),
+		EtcdEndpoints:            splitOr("ETCD_ENDPOINTS", "localhost:2379"),
+		EtcdUser:                 envOr("ETCD_USER", ""),
+		EtcdPassword:             envOr("ETCD_PASSWORD", ""),
+		LeaderElectionKey:        envOr("LEADER_ELECTION_KEY", "/shirods/controlplane/leader"),
+		CassandraHosts:           splitOr("CASSANDRA_HOSTS", "localhost:9042"),
+		CassandraKeyspace:        envOr("CASSANDRA_KEYSPACE", "shirods"),
+		CassandraUser:            envOr("CASSANDRA_USER", ""),
+		CassandraPassword:        envOr("CASSANDRA_PASSWORD", ""),
+		TLSCAFile:                envOr("TLS_CA_FILE", ""),
+		TLSCertFile:              envOr("TLS_CERT_FILE", ""),
+		TLSKeyFile:               envOr("TLS_KEY_FILE", ""),
+		TLSServerName:            envOr("TLS_SERVER_NAME", ""),
+		TLSInsecureSkipVerify:    boolOr("TLS_INSECURE_SKIP_VERIFY", false),
+		APIBearerToken:           envOr("API_BEARER_TOKEN", ""),
+		APIPublishTokens:         splitOr("API_ACL_PUBLISH_TOKENS", ""),
+		APIReadTokens:            splitOr("API_ACL_READ_TOKENS", ""),
+		APIAdminTokens:           splitOr("API_ACL_ADMIN_TOKENS", ""),
+		DisableAPITokenAuth:      boolOr("DISABLE_API_TOKEN_AUTH", false),
+		PublishRetryMax:          intOr("PUBLISH_RETRY_MAX", 4),
+		PublishRetryBackoffMs:    intOr("PUBLISH_RETRY_BACKOFF_MS", 150),
+		PublishRetryMaxBackoffMs: intOr("PUBLISH_RETRY_MAX_BACKOFF_MS", 3000),
 	}
 }
 
@@ -96,4 +103,16 @@ func boolOr(key string, fallback bool) bool {
 		return fallback
 	}
 	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func intOr(key string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
 }

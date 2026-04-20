@@ -27,8 +27,10 @@ type App struct {
 	coord modules.Coordinator
 	store modules.EventStore
 
-	reqs *prometheus.CounterVec
-	lat  *prometheus.HistogramVec
+	reqs        *prometheus.CounterVec
+	lat         *prometheus.HistogramVec
+	pubRetries  prometheus.Counter
+	pubFailures prometheus.Counter
 }
 
 type publishRequest struct {
@@ -61,6 +63,14 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 		Help:    "HTTP request duration seconds grouped by path and method",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"path", "method"})
+	a.pubRetries = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "shiro_publish_retries_total",
+		Help: "Total publish retry attempts",
+	})
+	a.pubFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "shiro_publish_failures_total",
+		Help: "Total publish failures after retries",
+	})
 	return a
 }
 
@@ -239,7 +249,7 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !result.Published {
-		brokerID, err := a.bus.Publish(r.Context(), result.Event.Subject, []byte(result.Event.Payload), result.Event.ID)
+		brokerID, err := a.publishWithRetry(r.Context(), result.Event.Subject, []byte(result.Event.Payload), result.Event.ID)
 		if err != nil {
 			http.Error(w, "publish error: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -355,6 +365,68 @@ func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func (a *App) publishWithRetry(ctx context.Context, subject string, payload []byte, messageID string) (string, error) {
+	attempts := a.cfg.PublishRetryMax
+	if attempts <= 0 {
+		attempts = 1
+	}
+	backoff := time.Duration(a.cfg.PublishRetryBackoffMs) * time.Millisecond
+	if backoff <= 0 {
+		backoff = 150 * time.Millisecond
+	}
+	maxBackoff := time.Duration(a.cfg.PublishRetryMaxBackoffMs) * time.Millisecond
+	if maxBackoff <= 0 {
+		maxBackoff = 3 * time.Second
+	}
+
+	var lastErr error
+	wait := backoff
+	for attempt := 1; attempt <= attempts; attempt++ {
+		id, err := a.bus.Publish(ctx, subject, payload, messageID)
+		if err == nil {
+			return id, nil
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		if a.pubRetries != nil {
+			a.pubRetries.Inc()
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		wait *= 2
+		if wait > maxBackoff {
+			wait = maxBackoff
+		}
+	}
+
+	if a.pubFailures != nil {
+		a.pubFailures.Inc()
+	}
+	// Best-effort dead-letter publish for offline analysis.
+	dlq := "events.dlq"
+	if subject != "" {
+		dlq = subject + ".dlq"
+	}
+	dlqMsg := map[string]any{
+		"subject":   subject,
+		"messageId": messageID,
+		"error":     lastErr.Error(),
+		"payload":   string(payload),
+		"failedAt":  time.Now().UTC(),
+	}
+	if raw, err := json.Marshal(dlqMsg); err == nil {
+		_, _ = a.bus.Publish(context.Background(), dlq, raw, messageID+"-dlq")
+	}
+	return "", lastErr
 }
 
 type statusRecorder struct {
