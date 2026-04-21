@@ -1,0 +1,40 @@
+name: Checklist Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate-checklist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate 100-point checklist format
+        shell: bash
+        run: |
+          file="docs/distributed-system-100-checklist.md"
+          test -f "$file"
+          total=$(grep -E '^[0-9]+\.' "$file" | wc -l | tr -d ' ')
+          if [ "$total" -ne 100 ]; then
+            echo "Expected 100 checklist entries, got $total"
+            exit 1
+          fi
+          bad=$(grep -E '^[0-9]+\.' "$file" | grep -vcE '`(DONE|GAP)`$' || true)
+          if [ "$bad" -ne 0 ]; then
+            echo "Each checklist entry must end with \`DONE\` or \`GAP\`"
+            exit 1
+          fi
+
+      - name: Summarize completion
+        shell: bash
+        run: |
+          file="docs/distributed-system-100-checklist.md"
+          done_count=$(grep -E '^[0-9]+\.' "$file" | grep -c '`DONE`$' || true)
+          gap_count=$(grep -E '^[0-9]+\.' "$file" | grep -c '`GAP`$' || true)
+          echo "Checklist DONE: $done_count"
+          echo "Checklist GAP:  $gap_count"

@@ -7,82 +7,112 @@ import (
 )
 
 type Config struct {
-	HTTPAddr                 string
-	NodeID                   string
-	NATSURL                  string
-	NATSStream               string
-	NATSUser                 string
-	NATSPassword             string
-	NATSToken                string
-	EtcdEndpoints            []string
-	EtcdUser                 string
-	EtcdPassword             string
-	LeaderElectionKey        string
-	CassandraHosts           []string
-	CassandraKeyspace        string
-	CassandraUser            string
-	CassandraPassword        string
-	TLSCAFile                string
-	TLSCertFile              string
-	TLSKeyFile               string
-	TLSServerName            string
-	TLSInsecureSkipVerify    bool
-	APIBearerToken           string
-	APIPublishTokens         []string
-	APIReadTokens            []string
-	APIAdminTokens           []string
-	DisableAPITokenAuth      bool
-	PublishRetryMax          int
-	PublishRetryBackoffMs    int
-	PublishRetryMaxBackoffMs int
-	OutboxRelayIntervalMs    int
-	OutboxRelayBatchSize     int
-	RateLimitRPS             int
-	RateLimitBurst           int
-	MaxRequestBodyBytes      int64
-	AuditLogEnabled          bool
-	OTELServiceName          string
-	OTELExporterOTLPEndpoint string
+	HTTPAddr                  string
+	HTTPReadTimeoutMs         int
+	HTTPReadHeaderTimeoutMs   int
+	HTTPWriteTimeoutMs        int
+	HTTPIdleTimeoutMs         int
+	HTTPShutdownTimeoutMs     int
+	HTTPRequestTimeoutMs      int
+	MaxConcurrentRequests     int
+	MaxConcurrentPublishes    int
+	MaxConcurrentQueries      int
+	ModuleStartRetryMax       int
+	ModuleStartRetryBackoffMs int
+	NodeID                    string
+	NATSURL                   string
+	NATSStream                string
+	NATSUser                  string
+	NATSPassword              string
+	NATSToken                 string
+	EtcdEndpoints             []string
+	EtcdUser                  string
+	EtcdPassword              string
+	LeaderElectionKey         string
+	CassandraHosts            []string
+	CassandraKeyspace         string
+	CassandraUser             string
+	CassandraPassword         string
+	TLSCAFile                 string
+	TLSCertFile               string
+	TLSKeyFile                string
+	TLSServerName             string
+	TLSInsecureSkipVerify     bool
+	APIBearerToken            string
+	APIPublishTokens          []string
+	APIReadTokens             []string
+	APIAdminTokens            []string
+	DisableAPITokenAuth       bool
+	PublishRetryMax           int
+	PublishRetryBackoffMs     int
+	PublishRetryMaxBackoffMs  int
+	OutboxRelayIntervalMs     int
+	OutboxRelayBatchSize      int
+	RateLimitRPS              int
+	RateLimitBurst            int
+	RateLimitMaxIPs           int
+	RateLimitIPTTLSeconds     int
+	MaxRequestBodyBytes       int64
+	SecurityHeadersEnabled    bool
+	AuditLogEnabled           bool
+	RequireLeaderForWrites    bool
+	OTELServiceName           string
+	OTELExporterOTLPEndpoint  string
 }
 
 func FromEnv() Config {
 	return Config{
-		HTTPAddr:                 envOr("HTTP_ADDR", ":8080"),
-		NodeID:                   envOr("NODE_ID", hostOr("node-1")),
-		NATSURL:                  envOr("NATS_URL", "nats://localhost:4222"),
-		NATSStream:               envOr("NATS_STREAM", "SHIRO_EVENTS"),
-		NATSUser:                 envOr("NATS_USER", ""),
-		NATSPassword:             envOr("NATS_PASSWORD", ""),
-		NATSToken:                envOr("NATS_TOKEN", ""),
-		EtcdEndpoints:            splitOr("ETCD_ENDPOINTS", "localhost:2379"),
-		EtcdUser:                 envOr("ETCD_USER", ""),
-		EtcdPassword:             envOr("ETCD_PASSWORD", ""),
-		LeaderElectionKey:        envOr("LEADER_ELECTION_KEY", "/shirods/controlplane/leader"),
-		CassandraHosts:           splitOr("CASSANDRA_HOSTS", "localhost:9042"),
-		CassandraKeyspace:        envOr("CASSANDRA_KEYSPACE", "shirods"),
-		CassandraUser:            envOr("CASSANDRA_USER", ""),
-		CassandraPassword:        envOr("CASSANDRA_PASSWORD", ""),
-		TLSCAFile:                envOr("TLS_CA_FILE", ""),
-		TLSCertFile:              envOr("TLS_CERT_FILE", ""),
-		TLSKeyFile:               envOr("TLS_KEY_FILE", ""),
-		TLSServerName:            envOr("TLS_SERVER_NAME", ""),
-		TLSInsecureSkipVerify:    boolOr("TLS_INSECURE_SKIP_VERIFY", false),
-		APIBearerToken:           envOr("API_BEARER_TOKEN", ""),
-		APIPublishTokens:         splitOr("API_ACL_PUBLISH_TOKENS", ""),
-		APIReadTokens:            splitOr("API_ACL_READ_TOKENS", ""),
-		APIAdminTokens:           splitOr("API_ACL_ADMIN_TOKENS", ""),
-		DisableAPITokenAuth:      boolOr("DISABLE_API_TOKEN_AUTH", false),
-		PublishRetryMax:          intOr("PUBLISH_RETRY_MAX", 4),
-		PublishRetryBackoffMs:    intOr("PUBLISH_RETRY_BACKOFF_MS", 150),
-		PublishRetryMaxBackoffMs: intOr("PUBLISH_RETRY_MAX_BACKOFF_MS", 3000),
-		OutboxRelayIntervalMs:    intOr("OUTBOX_RELAY_INTERVAL_MS", 1500),
-		OutboxRelayBatchSize:     intOr("OUTBOX_RELAY_BATCH_SIZE", 100),
-		RateLimitRPS:             intOr("RATE_LIMIT_RPS", 60),
-		RateLimitBurst:           intOr("RATE_LIMIT_BURST", 120),
-		MaxRequestBodyBytes:      int64Or("MAX_REQUEST_BODY_BYTES", 1<<20),
-		AuditLogEnabled:          boolOr("AUDIT_LOG_ENABLED", true),
-		OTELServiceName:          envOr("OTEL_SERVICE_NAME", "shiro-distributed-system"),
-		OTELExporterOTLPEndpoint: envOr("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		HTTPAddr:                  envOr("HTTP_ADDR", ":8080"),
+		HTTPReadTimeoutMs:         intOr("HTTP_READ_TIMEOUT_MS", 10000),
+		HTTPReadHeaderTimeoutMs:   intOr("HTTP_READ_HEADER_TIMEOUT_MS", 3000),
+		HTTPWriteTimeoutMs:        intOr("HTTP_WRITE_TIMEOUT_MS", 15000),
+		HTTPIdleTimeoutMs:         intOr("HTTP_IDLE_TIMEOUT_MS", 60000),
+		HTTPShutdownTimeoutMs:     intOr("HTTP_SHUTDOWN_TIMEOUT_MS", 10000),
+		HTTPRequestTimeoutMs:      intOr("HTTP_REQUEST_TIMEOUT_MS", 8000),
+		MaxConcurrentRequests:     intOr("MAX_CONCURRENT_REQUESTS", 500),
+		MaxConcurrentPublishes:    intOr("MAX_CONCURRENT_PUBLISHES", 200),
+		MaxConcurrentQueries:      intOr("MAX_CONCURRENT_QUERIES", 300),
+		ModuleStartRetryMax:       intOr("MODULE_START_RETRY_MAX", 4),
+		ModuleStartRetryBackoffMs: intOr("MODULE_START_RETRY_BACKOFF_MS", 1000),
+		NodeID:                    envOr("NODE_ID", hostOr("node-1")),
+		NATSURL:                   envOr("NATS_URL", "nats://localhost:4222"),
+		NATSStream:                envOr("NATS_STREAM", "SHIRO_EVENTS"),
+		NATSUser:                  envOr("NATS_USER", ""),
+		NATSPassword:              envOr("NATS_PASSWORD", ""),
+		NATSToken:                 envOr("NATS_TOKEN", ""),
+		EtcdEndpoints:             splitOr("ETCD_ENDPOINTS", "localhost:2379"),
+		EtcdUser:                  envOr("ETCD_USER", ""),
+		EtcdPassword:              envOr("ETCD_PASSWORD", ""),
+		LeaderElectionKey:         envOr("LEADER_ELECTION_KEY", "/shirods/controlplane/leader"),
+		CassandraHosts:            splitOr("CASSANDRA_HOSTS", "localhost:9042"),
+		CassandraKeyspace:         envOr("CASSANDRA_KEYSPACE", "shirods"),
+		CassandraUser:             envOr("CASSANDRA_USER", ""),
+		CassandraPassword:         envOr("CASSANDRA_PASSWORD", ""),
+		TLSCAFile:                 envOr("TLS_CA_FILE", ""),
+		TLSCertFile:               envOr("TLS_CERT_FILE", ""),
+		TLSKeyFile:                envOr("TLS_KEY_FILE", ""),
+		TLSServerName:             envOr("TLS_SERVER_NAME", ""),
+		TLSInsecureSkipVerify:     boolOr("TLS_INSECURE_SKIP_VERIFY", false),
+		APIBearerToken:            envOr("API_BEARER_TOKEN", ""),
+		APIPublishTokens:          splitOr("API_ACL_PUBLISH_TOKENS", ""),
+		APIReadTokens:             splitOr("API_ACL_READ_TOKENS", ""),
+		APIAdminTokens:            splitOr("API_ACL_ADMIN_TOKENS", ""),
+		DisableAPITokenAuth:       boolOr("DISABLE_API_TOKEN_AUTH", false),
+		PublishRetryMax:           intOr("PUBLISH_RETRY_MAX", 4),
+		PublishRetryBackoffMs:     intOr("PUBLISH_RETRY_BACKOFF_MS", 150),
+		PublishRetryMaxBackoffMs:  intOr("PUBLISH_RETRY_MAX_BACKOFF_MS", 3000),
+		OutboxRelayIntervalMs:     intOr("OUTBOX_RELAY_INTERVAL_MS", 1500),
+		OutboxRelayBatchSize:      intOr("OUTBOX_RELAY_BATCH_SIZE", 100),
+		RateLimitRPS:              intOr("RATE_LIMIT_RPS", 60),
+		RateLimitBurst:            intOr("RATE_LIMIT_BURST", 120),
+		RateLimitMaxIPs:           intOr("RATE_LIMIT_MAX_IPS", 10000),
+		RateLimitIPTTLSeconds:     intOr("RATE_LIMIT_IP_TTL_SECONDS", 900),
+		MaxRequestBodyBytes:       int64Or("MAX_REQUEST_BODY_BYTES", 1<<20),
+		SecurityHeadersEnabled:    boolOr("SECURITY_HEADERS_ENABLED", true),
+		AuditLogEnabled:           boolOr("AUDIT_LOG_ENABLED", true),
+		RequireLeaderForWrites:    boolOr("REQUIRE_LEADER_FOR_WRITES", false),
+		OTELServiceName:           envOr("OTEL_SERVICE_NAME", "shiro-distributed-system"),
+		OTELExporterOTLPEndpoint:  envOr("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
 }
 

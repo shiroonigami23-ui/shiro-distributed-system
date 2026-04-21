@@ -2,15 +2,19 @@ package core
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/netip"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,6 +44,10 @@ type App struct {
 	pubFailures prometheus.Counter
 	tracer      trace.Tracer
 	limiter     *ipRateLimiter
+	guard       chan struct{}
+	pubGuard    chan struct{}
+	queryGuard  chan struct{}
+	started     atomic.Bool
 }
 
 type publishRequest struct {
@@ -81,21 +89,33 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 		Help: "Total publish failures after retries",
 	})
 	a.tracer = otel.Tracer("shiro.core")
-	a.limiter = newIPRateLimiter(rate.Limit(max(1, cfg.RateLimitRPS)), max(1, cfg.RateLimitBurst))
+	a.limiter = newIPRateLimiter(
+		rate.Limit(max(1, cfg.RateLimitRPS)),
+		max(1, cfg.RateLimitBurst),
+		max(100, cfg.RateLimitMaxIPs),
+		time.Duration(max(60, cfg.RateLimitIPTTLSeconds))*time.Second,
+	)
+	a.guard = make(chan struct{}, max(1, cfg.MaxConcurrentRequests))
+	a.pubGuard = make(chan struct{}, max(1, cfg.MaxConcurrentPublishes))
+	a.queryGuard = make(chan struct{}, max(1, cfg.MaxConcurrentQueries))
 	return a
 }
 
 func (a *App) Run(ctx context.Context) error {
 	for _, m := range a.modules {
-		if err := m.Start(ctx); err != nil {
+		if err := a.startModuleWithRetry(ctx, m); err != nil {
 			return fmt.Errorf("start %s: %w", m.Name(), err)
 		}
 		log.Printf("module started: %s", m.Name())
 	}
+	a.started.Store(true)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", a.handleHealth)
+	mux.HandleFunc("/readyz", a.handleHealth)
+	mux.HandleFunc("/livez", a.handleLive)
+	mux.HandleFunc("/startupz", a.handleStartup)
 	mux.Handle("/leaderz", a.secure("admin", http.HandlerFunc(a.handleLeader)))
 	mux.Handle("/events", a.secure("rw", http.HandlerFunc(a.handleEvents)))
 	mux.Handle("/stream", a.secure("read", http.HandlerFunc(a.handleStream)))
@@ -105,8 +125,12 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	srv := &http.Server{
-		Addr:    a.cfg.HTTPAddr,
-		Handler: a.withRateLimit(a.instrument(mux)),
+		Addr:              a.cfg.HTTPAddr,
+		Handler:           a.withRecovery(a.withSecurityHeaders(a.withRequestID(a.withRequestTimeout(a.withConcurrencyLimit(a.withRateLimit(a.instrument(mux))))))),
+		ReadTimeout:       time.Duration(max(1, a.cfg.HTTPReadTimeoutMs)) * time.Millisecond,
+		ReadHeaderTimeout: time.Duration(max(1, a.cfg.HTTPReadHeaderTimeoutMs)) * time.Millisecond,
+		WriteTimeout:      time.Duration(max(1, a.cfg.HTTPWriteTimeoutMs)) * time.Millisecond,
+		IdleTimeout:       time.Duration(max(1, a.cfg.HTTPIdleTimeoutMs)) * time.Millisecond,
 	}
 
 	errCh := make(chan error, 1)
@@ -123,7 +147,7 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Duration(max(1, a.cfg.HTTPShutdownTimeoutMs))*time.Millisecond)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 
@@ -192,7 +216,7 @@ func (a *App) instrument(next http.Handler) http.Handler {
 			span.SetStatus(codes.Error, "server error")
 		}
 		if a.cfg.AuditLogEnabled {
-			log.Printf("audit method=%s path=%s status=%d duration_ms=%d remote=%s", r.Method, r.URL.Path, rec.status, time.Since(start).Milliseconds(), r.RemoteAddr)
+			log.Printf("audit request_id=%s method=%s path=%s status=%d duration_ms=%d remote=%s", requestIDFromContext(r.Context()), r.Method, r.URL.Path, rec.status, time.Since(start).Milliseconds(), r.RemoteAddr)
 		}
 	})
 }
@@ -208,17 +232,161 @@ func (a *App) withRateLimit(next http.Handler) http.Handler {
 	})
 }
 
+func (a *App) withRequestTimeout(next http.Handler) http.Handler {
+	timeout := time.Duration(max(1, a.cfg.HTTPRequestTimeoutMs)) * time.Millisecond
+	timeoutHandler := http.TimeoutHandler(next, timeout, "request timeout")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// SSE stream endpoints are long-lived and should not be bounded by request timeout.
+		if r.URL.Path == "/stream" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		timeoutHandler.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) withRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+		if rid == "" {
+			rid = newRequestID()
+		}
+		w.Header().Set("X-Request-Id", rid)
+		ctx := context.WithValue(r.Context(), requestIDContextKey{}, rid)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (a *App) withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.SecurityHeadersEnabled {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) withConcurrencyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case a.guard <- struct{}{}:
+			defer func() { <-a.guard }()
+			next.ServeHTTP(w, r)
+		default:
+			http.Error(w, "server busy", http.StatusServiceUnavailable)
+		}
+	})
+}
+
+func (a *App) withRecovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic recovered path=%s err=%v stack=%s", r.URL.Path, rec, string(debug.Stack()))
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) startModuleWithRetry(ctx context.Context, m modules.Module) error {
+	maxAttempts := max(1, a.cfg.ModuleStartRetryMax)
+	wait := time.Duration(max(100, a.cfg.ModuleStartRetryBackoffMs)) * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := m.Start(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			log.Printf("module start attempt failed module=%s attempt=%d/%d err=%v", m.Name(), attempt, maxAttempts, err)
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if wait < 10*time.Second {
+			wait *= 2
+			if wait > 10*time.Second {
+				wait = 10 * time.Second
+			}
+		}
+	}
+	return lastErr
+}
+
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	tctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	for _, m := range a.modules {
-		if err := m.Ready(tctx); err != nil {
-			http.Error(w, m.Name()+": "+err.Error(), http.StatusServiceUnavailable)
-			return
-		}
+	type moduleStatus struct {
+		Name      string `json:"name"`
+		Ready     bool   `json:"ready"`
+		Error     string `json:"error,omitempty"`
+		LatencyMs int64  `json:"latency_ms"`
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
+	statuses := make([]moduleStatus, 0, len(a.modules))
+	overallReady := true
+	for _, m := range a.modules {
+		start := time.Now()
+		if err := m.Ready(tctx); err != nil {
+			overallReady = false
+			statuses = append(statuses, moduleStatus{
+				Name:      m.Name(),
+				Ready:     false,
+				Error:     err.Error(),
+				LatencyMs: time.Since(start).Milliseconds(),
+			})
+			continue
+		}
+		statuses = append(statuses, moduleStatus{
+			Name:      m.Name(),
+			Ready:     true,
+			LatencyMs: time.Since(start).Milliseconds(),
+		})
+	}
+	code := http.StatusOK
+	if !overallReady {
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, map[string]any{
+		"status":  map[bool]string{true: "ok", false: "degraded"}[overallReady],
+		"node_id": a.cfg.NodeID,
+		"time":    time.Now().UTC(),
+		"modules": statuses,
+	})
+}
+
+func (a *App) handleLive(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "alive",
+		"node_id": a.cfg.NodeID,
+		"time":    time.Now().UTC(),
+	})
+}
+
+func (a *App) handleStartup(w http.ResponseWriter, r *http.Request) {
+	if !a.started.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status":  "starting",
+			"node_id": a.cfg.NodeID,
+			"time":    time.Now().UTC(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "started",
+		"node_id": a.cfg.NodeID,
+		"time":    time.Now().UTC(),
+	})
 }
 
 func (a *App) handleLeader(w http.ResponseWriter, r *http.Request) {
@@ -246,8 +414,18 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
+	if !acquireGuard(a.pubGuard) {
+		http.Error(w, "publish lane busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseGuard(a.pubGuard)
+
 	if a.bus == nil || a.store == nil {
 		http.Error(w, "event bus/store not configured", http.StatusInternalServerError)
+		return
+	}
+	if a.cfg.RequireLeaderForWrites && a.coord != nil && !a.coord.IsLeader() {
+		http.Error(w, "write rejected on follower; leader="+a.coord.LeaderID(), http.StatusServiceUnavailable)
 		return
 	}
 
@@ -316,6 +494,12 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleListEvents(w http.ResponseWriter, r *http.Request) {
+	if !acquireGuard(a.queryGuard) {
+		http.Error(w, "query lane busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseGuard(a.queryGuard)
+
 	if a.store == nil {
 		http.Error(w, "event store not configured", http.StatusInternalServerError)
 		return
@@ -560,29 +744,85 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 type ipRateLimiter struct {
-	r    rate.Limit
-	b    int
-	mu   sync.Mutex
-	data map[string]*rate.Limiter
+	r             rate.Limit
+	b             int
+	maxIPs        int
+	ttl           time.Duration
+	nextSweep     time.Time
+	mu            sync.Mutex
+	data          map[string]*ipLimiterEntry
+	lastEvictedIP string
 }
 
-func newIPRateLimiter(r rate.Limit, b int) *ipRateLimiter {
+type ipLimiterEntry struct {
+	lim      *rate.Limiter
+	lastSeen time.Time
+}
+
+func newIPRateLimiter(r rate.Limit, b int, maxIPs int, ttl time.Duration) *ipRateLimiter {
 	return &ipRateLimiter{
-		r:    r,
-		b:    b,
-		data: make(map[string]*rate.Limiter),
+		r:         r,
+		b:         b,
+		maxIPs:    max(100, maxIPs),
+		ttl:       ttl,
+		nextSweep: time.Now().Add(time.Minute),
+		data:      make(map[string]*ipLimiterEntry),
 	}
 }
 
 func (l *ipRateLimiter) Allow(ip string) bool {
+	now := time.Now()
 	l.mu.Lock()
-	lim, ok := l.data[ip]
-	if !ok {
-		lim = rate.NewLimiter(l.r, l.b)
-		l.data[ip] = lim
+	if now.After(l.nextSweep) {
+		l.sweepLocked(now)
 	}
+	entry, ok := l.data[ip]
+	if !ok {
+		if len(l.data) >= l.maxIPs {
+			l.evictOldestLocked()
+		}
+		entry = &ipLimiterEntry{
+			lim:      rate.NewLimiter(l.r, l.b),
+			lastSeen: now,
+		}
+		l.data[ip] = entry
+	}
+	entry.lastSeen = now
 	l.mu.Unlock()
-	return lim.Allow()
+	return entry.lim.Allow()
+}
+
+func (l *ipRateLimiter) sweepLocked(now time.Time) {
+	if l.ttl <= 0 {
+		l.nextSweep = now.Add(time.Minute)
+		return
+	}
+	cutoff := now.Add(-l.ttl)
+	for ip, entry := range l.data {
+		if entry.lastSeen.Before(cutoff) {
+			delete(l.data, ip)
+		}
+	}
+	l.nextSweep = now.Add(time.Minute)
+}
+
+func (l *ipRateLimiter) evictOldestLocked() {
+	var (
+		oldestIP   string
+		oldestSeen time.Time
+		first      = true
+	)
+	for ip, entry := range l.data {
+		if first || entry.lastSeen.Before(oldestSeen) {
+			first = false
+			oldestIP = ip
+			oldestSeen = entry.lastSeen
+		}
+	}
+	if oldestIP != "" {
+		delete(l.data, oldestIP)
+		l.lastEvictedIP = oldestIP
+	}
 }
 
 func clientIP(remoteAddr string) string {
@@ -609,4 +849,40 @@ func appTracer(a *App) trace.Tracer {
 		return a.tracer
 	}
 	return otel.Tracer("shiro.core")
+}
+
+type requestIDContextKey struct{}
+
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(requestIDContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func newRequestID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return hex.EncodeToString(b)
+}
+
+func acquireGuard(ch chan struct{}) bool {
+	select {
+	case ch <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseGuard(ch chan struct{}) {
+	select {
+	case <-ch:
+	default:
+	}
 }

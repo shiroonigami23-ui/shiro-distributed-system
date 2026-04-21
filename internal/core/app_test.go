@@ -3,6 +3,9 @@ package core
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,5 +101,93 @@ func TestPublishWithRetryFails(t *testing.T) {
 	}
 	if b.lastSubject != "events.orders.dlq" {
 		t.Fatalf("expected last subject to be DLQ, got %q", b.lastSubject)
+	}
+}
+
+type fakeModule struct {
+	name     string
+	readyErr error
+}
+
+func (f fakeModule) Name() string                    { return f.name }
+func (f fakeModule) Start(ctx context.Context) error { return nil }
+func (f fakeModule) Ready(ctx context.Context) error { return f.readyErr }
+func (f fakeModule) Stop(ctx context.Context) error  { return nil }
+
+func TestWithRequestID(t *testing.T) {
+	a := &App{}
+	h := a.withRequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := requestIDFromContext(r.Context()); got == "" {
+			t.Fatalf("expected request id in context")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Fatalf("expected X-Request-Id header")
+	}
+}
+
+func TestWithConcurrencyLimitRejectsWhenFull(t *testing.T) {
+	a := &App{guard: make(chan struct{}, 1)}
+	a.guard <- struct{}{}
+	defer func() { <-a.guard }()
+
+	h := a.withConcurrencyLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected %d, got %d", http.StatusServiceUnavailable, rec.Code)
+	}
+}
+
+func TestHandleLive(t *testing.T) {
+	a := &App{cfg: config.Config{NodeID: "n1"}}
+	req := httptest.NewRequest(http.MethodGet, "/livez", nil)
+	rec := httptest.NewRecorder()
+	a.handleLive(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "\"alive\"") {
+		t.Fatalf("expected alive response, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleHealthDegraded(t *testing.T) {
+	a := &App{
+		cfg:     config.Config{NodeID: "n1"},
+		modules: []modules.Module{fakeModule{name: "m1", readyErr: errors.New("down")}},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	a.handleHealth(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "\"degraded\"") {
+		t.Fatalf("expected degraded response, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleStartup(t *testing.T) {
+	a := &App{cfg: config.Config{NodeID: "n1"}}
+	req := httptest.NewRequest(http.MethodGet, "/startupz", nil)
+	rec := httptest.NewRecorder()
+	a.handleStartup(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 before started, got %d", rec.Code)
+	}
+	a.started.Store(true)
+	rec = httptest.NewRecorder()
+	a.handleStartup(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 after started, got %d", rec.Code)
 	}
 }

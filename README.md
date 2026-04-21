@@ -28,12 +28,24 @@ A production-grade distributed-system control plane focused on secure coordinati
 - Configurable publish retry/backoff with dead-letter fallback
 - OpenTelemetry tracing (HTTP + NATS + Cassandra spans)
 - Rate limiting, request size limits, and structured audit logs
+- Panic recovery middleware with stack logging
+- Configurable HTTP read/write/idle/request/shutdown timeouts
+- Optional leader-only writes (`REQUIRE_LEADER_FOR_WRITES`) to avoid split-brain API writes
+- Bounded per-IP limiter state (TTL + max tracked IPs) to resist memory growth attacks
+- Request ID propagation (`X-Request-Id`) and audit correlation
+- Global request concurrency guard
+- Dedicated publish/query bulkhead lanes
+- Security headers middleware
+- Module startup retry with exponential backoff
 - Prometheus metrics endpoint `/metrics`
 - Kubernetes deployment + HPA + ServiceMonitor manifests
 - CI workflow for formatting/build/test gates
 
 ## API Endpoints
-- `GET /healthz` readiness status
+- `GET /healthz` readiness report (JSON per-module status)
+- `GET /readyz` readiness alias
+- `GET /livez` liveness status
+- `GET /startupz` startup status
 - `GET /metrics` Prometheus metrics
 - `GET /leaderz` current leader and node leadership (admin scope)
 - `POST /events` persist + publish event with idempotency (rw scope)
@@ -53,6 +65,7 @@ Environment examples:
 - `API_ACL_PUBLISH_TOKENS`
 - `API_ACL_READ_TOKENS`
 - `DISABLE_API_TOKEN_AUTH=false`
+- `REQUIRE_LEADER_FOR_WRITES=false`
 
 ## mTLS + Credentials
 Supported module credentials:
@@ -66,6 +79,26 @@ Shared TLS options:
 - `TLS_KEY_FILE`
 - `TLS_SERVER_NAME`
 - `TLS_INSECURE_SKIP_VERIFY`
+
+HTTP safety knobs:
+- `HTTP_READ_TIMEOUT_MS`
+- `HTTP_READ_HEADER_TIMEOUT_MS`
+- `HTTP_WRITE_TIMEOUT_MS`
+- `HTTP_IDLE_TIMEOUT_MS`
+- `HTTP_REQUEST_TIMEOUT_MS` (skips `/stream` SSE)
+- `HTTP_SHUTDOWN_TIMEOUT_MS`
+- `MAX_CONCURRENT_REQUESTS`
+- `MAX_CONCURRENT_PUBLISHES`
+- `MAX_CONCURRENT_QUERIES`
+- `MODULE_START_RETRY_MAX`
+- `MODULE_START_RETRY_BACKOFF_MS`
+
+Limiter safety knobs:
+- `RATE_LIMIT_MAX_IPS`
+- `RATE_LIMIT_IP_TTL_SECONDS`
+
+Additional safety knobs:
+- `SECURITY_HEADERS_ENABLED=true`
 
 ## Local Run
 ```bash
