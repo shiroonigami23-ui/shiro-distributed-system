@@ -53,3 +53,41 @@ func TestParseRequiredFieldRules(t *testing.T) {
 		t.Fatalf("unexpected fields: %#v", got["order.created"])
 	}
 }
+
+func TestParseInt64Map(t *testing.T) {
+	t.Setenv("TEST_I64_MAP", "tokA=100,tokB=200,bad")
+	got := parseInt64Map("TEST_I64_MAP")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %#v", got)
+	}
+	if got["tokA"] != 100 || got["tokB"] != 200 {
+		t.Fatalf("unexpected values: %#v", got)
+	}
+}
+
+func TestConfigValidateSuccess(t *testing.T) {
+	cfg := FromEnv()
+	cfg.RejectUnknownEventTypes = true
+	cfg.EventTypeRegistry = []string{"order.created", "order.cancelled"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config, got %v", err)
+	}
+}
+
+func TestConfigValidateRejectUnknownTypesRequiresRegistry(t *testing.T) {
+	cfg := FromEnv()
+	cfg.RejectUnknownEventTypes = true
+	cfg.EventTypeRegistry = nil
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for empty event type registry")
+	}
+}
+
+func TestConfigValidateRejectsBackoffRange(t *testing.T) {
+	cfg := FromEnv()
+	cfg.OutboxBackoffBaseMs = 5000
+	cfg.OutboxBackoffMaxMs = 1000
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for invalid backoff range")
+	}
+}

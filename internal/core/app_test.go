@@ -214,3 +214,65 @@ func TestCircuitBreakerTransitions(t *testing.T) {
 		t.Fatalf("expected breaker to close after success in half-open")
 	}
 }
+
+func TestAuthFailureGuard(t *testing.T) {
+	g := newAuthFailureGuard(2, 100*time.Millisecond)
+	ip := "1.2.3.4"
+	if g.IsBlocked(ip) {
+		t.Fatalf("should not be blocked initially")
+	}
+	g.Failure(ip)
+	if g.IsBlocked(ip) {
+		t.Fatalf("should not be blocked after one failure")
+	}
+	g.Failure(ip)
+	if !g.IsBlocked(ip) {
+		t.Fatalf("should be blocked after threshold")
+	}
+	time.Sleep(110 * time.Millisecond)
+	if g.IsBlocked(ip) {
+		t.Fatalf("block should expire")
+	}
+}
+
+func TestIsAllowedOrigin(t *testing.T) {
+	if !isAllowedOrigin("https://a.example", []string{"https://a.example"}) {
+		t.Fatalf("expected exact origin allow")
+	}
+	if !isAllowedOrigin("https://b.example", []string{"*"}) {
+		t.Fatalf("expected wildcard allow")
+	}
+	if isAllowedOrigin("https://c.example", []string{"https://a.example"}) {
+		t.Fatalf("unexpected allow")
+	}
+}
+
+func TestValidatePublishRequestRejectsUnknownEventType(t *testing.T) {
+	a := &App{cfg: config.Config{
+		RejectUnknownEventTypes: true,
+		EventTypeRegistry:       []string{"order.created"},
+	}, eventTypes: map[string]struct{}{"order.created": {}}}
+	err := a.validatePublishRequest(publishRequest{
+		Type:          "payment.captured",
+		SchemaVersion: 1,
+		Payload:       []byte(`{"id":"x1"}`),
+	})
+	if err == nil {
+		t.Fatalf("expected unknown event type validation error")
+	}
+}
+
+func TestValidatePublishRequestAllowsKnownEventType(t *testing.T) {
+	a := &App{cfg: config.Config{
+		RejectUnknownEventTypes: true,
+		EventTypeRegistry:       []string{"order.created"},
+	}, eventTypes: map[string]struct{}{"order.created": {}}}
+	err := a.validatePublishRequest(publishRequest{
+		Type:          "order.created",
+		SchemaVersion: 1,
+		Payload:       []byte(`{"id":"x1"}`),
+	})
+	if err != nil {
+		t.Fatalf("expected request to validate, got %v", err)
+	}
+}

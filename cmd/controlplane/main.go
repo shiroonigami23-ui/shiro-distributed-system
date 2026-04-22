@@ -19,6 +19,9 @@ func main() {
 	defer stop()
 
 	cfg := config.FromEnv()
+	if err := cfg.Validate(); err != nil {
+		log.Fatal(err)
+	}
 	shutdownOtel, err := telemetry.Setup(ctx, cfg.OTELServiceName, cfg.OTELExporterOTLPEndpoint)
 	if err != nil {
 		log.Fatal(err)

@@ -52,6 +52,8 @@ type App struct {
 	storeBreaker   *circuitBreaker
 	moduleBreakers map[string]*circuitBreaker
 	subjectLimiter *subjectRateLimiter
+	authGuard      *authFailureGuard
+	eventTypes     map[string]struct{}
 }
 
 type publishRequest struct {
@@ -108,6 +110,10 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 		max(1, cfg.SubjectRateLimitBurst),
 		cfg.SubjectRateLimitOverrides,
 	)
+	a.authGuard = newAuthFailureGuard(
+		max(1, cfg.AuthFailureMaxAttempts),
+		time.Duration(max(1, cfg.AuthFailureBlockSeconds))*time.Second,
+	)
 	a.busBreaker = newCircuitBreaker(
 		"nats",
 		max(1, cfg.CircuitFailureThreshold),
@@ -121,6 +127,13 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 		max(1, cfg.CircuitHalfOpenSuccesses),
 	)
 	a.moduleBreakers = make(map[string]*circuitBreaker, len(ms))
+	a.eventTypes = make(map[string]struct{}, len(cfg.EventTypeRegistry))
+	for _, eventType := range cfg.EventTypeRegistry {
+		eventType = strings.TrimSpace(eventType)
+		if eventType != "" {
+			a.eventTypes[eventType] = struct{}{}
+		}
+	}
 	for _, m := range ms {
 		a.moduleBreakers[m.Name()] = newCircuitBreaker(
 			m.Name(),
@@ -162,7 +175,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	srv := &http.Server{
 		Addr:              a.cfg.HTTPAddr,
-		Handler:           a.withRecovery(a.withSecurityHeaders(a.withRequestID(a.withRequestTimeout(a.withConcurrencyLimit(a.withRateLimit(a.instrument(mux))))))),
+		Handler:           a.withRecovery(a.withCORS(a.withSecurityHeaders(a.withRequestID(a.withRequestTimeout(a.withConcurrencyLimit(a.withRateLimit(a.instrument(mux)))))))),
 		ReadTimeout:       time.Duration(max(1, a.cfg.HTTPReadTimeoutMs)) * time.Millisecond,
 		ReadHeaderTimeout: time.Duration(max(1, a.cfg.HTTPReadHeaderTimeoutMs)) * time.Millisecond,
 		WriteTimeout:      time.Duration(max(1, a.cfg.HTTPWriteTimeoutMs)) * time.Millisecond,
@@ -201,6 +214,12 @@ func (a *App) secure(scope string, next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r.RemoteAddr)
+		if a.authGuard != nil && a.authGuard.IsBlocked(ip) {
+			http.Error(w, "temporarily blocked due to auth failures", http.StatusTooManyRequests)
+			return
+		}
+
 		token := bearerToken(r.Header.Get("Authorization"))
 		if token == "" && a.cfg.APIBearerToken == "" && len(a.cfg.APIAdminTokens) == 0 && len(a.cfg.APIPublishTokens) == 0 && len(a.cfg.APIReadTokens) == 0 {
 			next.ServeHTTP(w, r)
@@ -208,10 +227,23 @@ func (a *App) secure(scope string, next http.Handler) http.Handler {
 		}
 
 		if token == "" {
+			if a.authGuard != nil {
+				a.authGuard.Failure(ip)
+			}
 			http.Error(w, "missing bearer token", http.StatusUnauthorized)
 			return
 		}
+		if exp, ok := a.cfg.APITokenExpirations[token]; ok && time.Now().Unix() > exp {
+			if a.authGuard != nil {
+				a.authGuard.Failure(ip)
+			}
+			http.Error(w, "token expired", http.StatusUnauthorized)
+			return
+		}
 		if a.cfg.APIBearerToken != "" && token == a.cfg.APIBearerToken {
+			if a.authGuard != nil {
+				a.authGuard.Success(ip)
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -226,8 +258,14 @@ func (a *App) secure(scope string, next http.Handler) http.Handler {
 			allowed = contains(a.cfg.APIPublishTokens, token) || contains(a.cfg.APIReadTokens, token) || contains(a.cfg.APIAdminTokens, token)
 		}
 		if !allowed {
+			if a.authGuard != nil {
+				a.authGuard.Failure(ip)
+			}
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
+		}
+		if a.authGuard != nil {
+			a.authGuard.Success(ip)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -300,6 +338,34 @@ func (a *App) withSecurityHeaders(next http.Handler) http.Handler {
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "no-referrer")
 			w.Header().Set("Cache-Control", "no-store")
+			if a.cfg.HSTSEnabled {
+				w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			}
+			if strings.TrimSpace(a.cfg.CSPHeader) != "" {
+				w.Header().Set("Content-Security-Policy", a.cfg.CSPHeader)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.cfg.CORSEnabled {
+			next.ServeHTTP(w, r)
+			return
+		}
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" && isAllowedOrigin(origin, a.cfg.CORSAllowedOrigins) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", strings.Join(a.cfg.CORSAllowedMethods, ", "))
+			w.Header().Set("Access-Control-Allow-Headers", strings.Join(a.cfg.CORSAllowedHeaders, ", "))
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -565,6 +631,10 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) validatePublishRequest(req publishRequest) error {
+	if a.cfg.RejectUnknownEventTypes && !a.isKnownEventType(req.Type) {
+		return fmt.Errorf("unknown event type %q", req.Type)
+	}
+
 	var payload any
 	if err := json.Unmarshal(req.Payload, &payload); err != nil {
 		return errors.New("payload must be valid JSON")
@@ -587,6 +657,17 @@ func (a *App) validatePublishRequest(req publishRequest) error {
 		}
 	}
 	return nil
+}
+
+func (a *App) isKnownEventType(eventType string) bool {
+	if eventType == "" {
+		return false
+	}
+	if len(a.eventTypes) == 0 {
+		return true
+	}
+	_, ok := a.eventTypes[eventType]
+	return ok
 }
 
 func (a *App) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
@@ -1312,4 +1393,68 @@ func (l *subjectRateLimiter) Allow(subject string) bool {
 	}
 	l.mu.Unlock()
 	return lim.Allow()
+}
+
+type authFailureGuard struct {
+	maxFailures int
+	blockFor    time.Duration
+	mu          sync.Mutex
+	failures    map[string]int
+	blockedTill map[string]time.Time
+}
+
+func newAuthFailureGuard(maxFailures int, blockFor time.Duration) *authFailureGuard {
+	return &authFailureGuard{
+		maxFailures: max(1, maxFailures),
+		blockFor:    blockFor,
+		failures:    map[string]int{},
+		blockedTill: map[string]time.Time{},
+	}
+}
+
+func (g *authFailureGuard) IsBlocked(ip string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	until, ok := g.blockedTill[ip]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(g.blockedTill, ip)
+		delete(g.failures, ip)
+		return false
+	}
+	return true
+}
+
+func (g *authFailureGuard) Failure(ip string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.failures[ip]++
+	if g.failures[ip] >= g.maxFailures {
+		g.blockedTill[ip] = time.Now().Add(g.blockFor)
+	}
+}
+
+func (g *authFailureGuard) Success(ip string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.failures, ip)
+	delete(g.blockedTill, ip)
+}
+
+func isAllowedOrigin(origin string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return false
+	}
+	for _, o := range allowed {
+		o = strings.TrimSpace(o)
+		if o == "" {
+			continue
+		}
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -35,6 +36,8 @@ type Config struct {
 	SubjectRateLimitOverrides map[string]int
 	SchemaVersionRules        map[string]VersionRange
 	SchemaRequiredFields      map[string][]string
+	EventTypeRegistry         []string
+	RejectUnknownEventTypes   bool
 	ModuleStartRetryMax       int
 	ModuleStartRetryBackoffMs int
 	NodeID                    string
@@ -56,11 +59,20 @@ type Config struct {
 	TLSKeyFile                string
 	TLSServerName             string
 	TLSInsecureSkipVerify     bool
+	CORSEnabled               bool
+	CORSAllowedOrigins        []string
+	CORSAllowedMethods        []string
+	CORSAllowedHeaders        []string
+	HSTSEnabled               bool
+	CSPHeader                 string
 	APIBearerToken            string
 	APIPublishTokens          []string
 	APIReadTokens             []string
 	APIAdminTokens            []string
+	APITokenExpirations       map[string]int64
 	DisableAPITokenAuth       bool
+	AuthFailureMaxAttempts    int
+	AuthFailureBlockSeconds   int
 	PublishRetryMax           int
 	PublishRetryBackoffMs     int
 	PublishRetryMaxBackoffMs  int
@@ -108,6 +120,8 @@ func FromEnv() Config {
 		SubjectRateLimitOverrides: parseIntMap("SUBJECT_RATE_LIMIT_RPS_OVERRIDES"),
 		SchemaVersionRules:        parseSchemaVersionRules("EVENT_SCHEMA_VERSION_RULES"),
 		SchemaRequiredFields:      parseRequiredFieldRules("EVENT_SCHEMA_REQUIRED_FIELDS"),
+		EventTypeRegistry:         splitOr("EVENT_TYPE_REGISTRY", ""),
+		RejectUnknownEventTypes:   boolOr("REJECT_UNKNOWN_EVENT_TYPES", false),
 		ModuleStartRetryMax:       intOr("MODULE_START_RETRY_MAX", 4),
 		ModuleStartRetryBackoffMs: intOr("MODULE_START_RETRY_BACKOFF_MS", 1000),
 		NodeID:                    envOr("NODE_ID", hostOr("node-1")),
@@ -129,11 +143,20 @@ func FromEnv() Config {
 		TLSKeyFile:                envOr("TLS_KEY_FILE", ""),
 		TLSServerName:             envOr("TLS_SERVER_NAME", ""),
 		TLSInsecureSkipVerify:     boolOr("TLS_INSECURE_SKIP_VERIFY", false),
+		CORSEnabled:               boolOr("CORS_ENABLED", false),
+		CORSAllowedOrigins:        splitOr("CORS_ALLOWED_ORIGINS", ""),
+		CORSAllowedMethods:        splitOr("CORS_ALLOWED_METHODS", "GET,POST,OPTIONS"),
+		CORSAllowedHeaders:        splitOr("CORS_ALLOWED_HEADERS", "Authorization,Content-Type,Idempotency-Key,X-Request-Id"),
+		HSTSEnabled:               boolOr("HSTS_ENABLED", false),
+		CSPHeader:                 envOr("CSP_HEADER", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
 		APIBearerToken:            envOr("API_BEARER_TOKEN", ""),
 		APIPublishTokens:          splitOr("API_ACL_PUBLISH_TOKENS", ""),
 		APIReadTokens:             splitOr("API_ACL_READ_TOKENS", ""),
 		APIAdminTokens:            splitOr("API_ACL_ADMIN_TOKENS", ""),
+		APITokenExpirations:       parseInt64Map("API_TOKEN_EXPIRATIONS"),
 		DisableAPITokenAuth:       boolOr("DISABLE_API_TOKEN_AUTH", false),
+		AuthFailureMaxAttempts:    intOr("AUTH_FAILURE_MAX_ATTEMPTS", 10),
+		AuthFailureBlockSeconds:   intOr("AUTH_FAILURE_BLOCK_SECONDS", 300),
 		PublishRetryMax:           intOr("PUBLISH_RETRY_MAX", 4),
 		PublishRetryBackoffMs:     intOr("PUBLISH_RETRY_BACKOFF_MS", 150),
 		PublishRetryMaxBackoffMs:  intOr("PUBLISH_RETRY_MAX_BACKOFF_MS", 3000),
@@ -150,6 +173,83 @@ func FromEnv() Config {
 		OTELServiceName:           envOr("OTEL_SERVICE_NAME", "shiro-distributed-system"),
 		OTELExporterOTLPEndpoint:  envOr("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
+}
+
+func (c Config) Validate() error {
+	var errs []string
+
+	if c.HTTPReadTimeoutMs <= 0 {
+		errs = append(errs, "HTTP_READ_TIMEOUT_MS must be > 0")
+	}
+	if c.HTTPReadHeaderTimeoutMs <= 0 {
+		errs = append(errs, "HTTP_READ_HEADER_TIMEOUT_MS must be > 0")
+	}
+	if c.HTTPWriteTimeoutMs <= 0 {
+		errs = append(errs, "HTTP_WRITE_TIMEOUT_MS must be > 0")
+	}
+	if c.HTTPIdleTimeoutMs <= 0 {
+		errs = append(errs, "HTTP_IDLE_TIMEOUT_MS must be > 0")
+	}
+	if c.HTTPRequestTimeoutMs <= 0 {
+		errs = append(errs, "HTTP_REQUEST_TIMEOUT_MS must be > 0")
+	}
+	if c.HTTPShutdownTimeoutMs <= 0 {
+		errs = append(errs, "HTTP_SHUTDOWN_TIMEOUT_MS must be > 0")
+	}
+	if c.MaxConcurrentRequests <= 0 {
+		errs = append(errs, "MAX_CONCURRENT_REQUESTS must be > 0")
+	}
+	if c.MaxConcurrentPublishes <= 0 {
+		errs = append(errs, "MAX_CONCURRENT_PUBLISHES must be > 0")
+	}
+	if c.MaxConcurrentQueries <= 0 {
+		errs = append(errs, "MAX_CONCURRENT_QUERIES must be > 0")
+	}
+	if c.PublishRetryMax <= 0 {
+		errs = append(errs, "PUBLISH_RETRY_MAX must be > 0")
+	}
+	if c.OutboxBackoffBaseMs <= 0 {
+		errs = append(errs, "OUTBOX_BACKOFF_BASE_MS must be > 0")
+	}
+	if c.OutboxBackoffMaxMs <= 0 {
+		errs = append(errs, "OUTBOX_BACKOFF_MAX_MS must be > 0")
+	}
+	if c.OutboxBackoffBaseMs > c.OutboxBackoffMaxMs {
+		errs = append(errs, "OUTBOX_BACKOFF_BASE_MS must be <= OUTBOX_BACKOFF_MAX_MS")
+	}
+	if c.OutboxQuarantineAfter <= 0 {
+		errs = append(errs, "OUTBOX_QUARANTINE_AFTER must be > 0")
+	}
+	if c.MaxRequestBodyBytes <= 0 {
+		errs = append(errs, "MAX_REQUEST_BODY_BYTES must be > 0")
+	}
+	if c.RateLimitRPS <= 0 {
+		errs = append(errs, "RATE_LIMIT_RPS must be > 0")
+	}
+	if c.RateLimitBurst <= 0 {
+		errs = append(errs, "RATE_LIMIT_BURST must be > 0")
+	}
+	if c.RateLimitMaxIPs <= 0 {
+		errs = append(errs, "RATE_LIMIT_MAX_IPS must be > 0")
+	}
+	if c.RateLimitIPTTLSeconds <= 0 {
+		errs = append(errs, "RATE_LIMIT_IP_TTL_SECONDS must be > 0")
+	}
+	if c.CORSEnabled {
+		if len(c.CORSAllowedMethods) == 0 {
+			errs = append(errs, "CORS_ALLOWED_METHODS must be non-empty when CORS_ENABLED=true")
+		}
+		if len(c.CORSAllowedHeaders) == 0 {
+			errs = append(errs, "CORS_ALLOWED_HEADERS must be non-empty when CORS_ENABLED=true")
+		}
+	}
+	if c.RejectUnknownEventTypes && len(c.EventTypeRegistry) == 0 {
+		errs = append(errs, "EVENT_TYPE_REGISTRY must be set when REJECT_UNKNOWN_EVENT_TYPES=true")
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid configuration: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 type VersionRange struct {
@@ -237,6 +337,35 @@ func parseIntMap(key string) map[string]int {
 			continue
 		}
 		n, err := strconv.Atoi(v)
+		if err != nil {
+			continue
+		}
+		out[k] = n
+	}
+	return out
+}
+
+func parseInt64Map(key string) map[string]int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	out := map[string]int64{}
+	if raw == "" {
+		return out
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		if k == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			continue
 		}

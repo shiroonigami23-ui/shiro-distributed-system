@@ -44,21 +44,21 @@ Status key:
 38. End-to-end idempotency key TTL/expiration policy - `DONE`
 39. Payload schema versioning and compatibility checks - `DONE`
 40. Input JSON schema validation - `DONE`
-41. Event type registry and unknown-type reject policy - `GAP`
+41. Event type registry and unknown-type reject policy - `DONE`
 42. Tenant isolation (tenant_id partitioning) - `GAP`
 43. Tenant-aware auth scopes - `GAP`
 44. Namespace-level quotas - `GAP`
 45. API key rotation endpoint/process - `GAP`
-46. Short-lived token support with exp/nbf checks - `GAP`
+46. Short-lived token support with exp/nbf checks - `DONE`
 47. mTLS certificate rotation without restart - `GAP`
 48. Secret manager integration (Vault/KMS) - `GAP`
 49. Encrypt sensitive event payload fields at rest - `GAP`
 50. PII redaction in audit logs - `GAP`
-51. CORS policy controls - `GAP`
-52. HSTS header support - `GAP`
-53. Content-Security-Policy for any UI surface - `GAP`
+51. CORS policy controls - `DONE`
+52. HSTS header support - `DONE`
+53. Content-Security-Policy for any UI surface - `DONE`
 54. API replay-attack nonce checks - `GAP`
-55. Brute-force protection for token failures - `GAP`
+55. Brute-force protection for token failures - `DONE`
 56. Prometheus RED metrics per route - `GAP`
 57. Per-dependency success/error/latency metrics - `GAP`
 58. Queue depth metrics (outbox/inbox) - `GAP`
@@ -81,7 +81,7 @@ Status key:
 75. Blue/green rollout manifests - `GAP`
 76. Versioned API contract and deprecation policy - `GAP`
 77. Backward compatibility matrix docs - `GAP`
-78. Config validation with fail-fast invalid ranges - `GAP`
+78. Config validation with fail-fast invalid ranges - `DONE`
 79. Dynamic config reload for runtime knobs - `GAP`
 80. Feature flag framework for gradual releases - `GAP`
 81. Controlled maintenance mode endpoint - `GAP`

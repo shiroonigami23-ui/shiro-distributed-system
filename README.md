@@ -51,7 +51,13 @@ A production-grade distributed-system control plane focused on secure coordinati
 - Poison-event quarantine and dead-letter replay endpoint
 - Automated cleanup for expired idempotency keys and aged dead letters
 - Type/schema version checks and required-field validation for payloads
+- Event type registry with unknown-type reject policy
 - Per-subject write rate limits
+- Configurable CORS policy middleware
+- Optional HSTS + CSP response headers
+- Token expiry enforcement for ACL/API tokens
+- Temporary IP block on repeated auth failures
+- Fail-fast startup config validation for unsafe/invalid ranges
 - Prometheus metrics endpoint `/metrics`
 - Kubernetes deployment + HPA + ServiceMonitor manifests
 - CI workflow for formatting/build/test gates
@@ -125,6 +131,8 @@ HTTP safety knobs:
 - `SUBJECT_RATE_LIMIT_RPS_OVERRIDES`
 - `EVENT_SCHEMA_VERSION_RULES`
 - `EVENT_SCHEMA_REQUIRED_FIELDS`
+- `EVENT_TYPE_REGISTRY`
+- `REJECT_UNKNOWN_EVENT_TYPES`
 - `MODULE_START_RETRY_MAX`
 - `MODULE_START_RETRY_BACKOFF_MS`
 
@@ -134,6 +142,15 @@ Limiter safety knobs:
 
 Additional safety knobs:
 - `SECURITY_HEADERS_ENABLED=true`
+- `CORS_ENABLED`
+- `CORS_ALLOWED_ORIGINS`
+- `CORS_ALLOWED_METHODS`
+- `CORS_ALLOWED_HEADERS`
+- `HSTS_ENABLED`
+- `CSP_HEADER`
+- `API_TOKEN_EXPIRATIONS`
+- `AUTH_FAILURE_MAX_ATTEMPTS`
+- `AUTH_FAILURE_BLOCK_SECONDS`
 
 ## Local Run
 ```bash
