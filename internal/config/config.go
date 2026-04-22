@@ -20,6 +20,21 @@ type Config struct {
 	CircuitFailureThreshold   int
 	CircuitOpenMs             int
 	CircuitHalfOpenSuccesses  int
+	PublishTimeoutMs          int
+	OutboxLeaseMs             int
+	OutboxBackoffBaseMs       int
+	OutboxBackoffMaxMs        int
+	OutboxBackoffJitterPct    int
+	OutboxQuarantineAfter     int
+	CleanupIntervalMs         int
+	CleanupBatchSize          int
+	IdempotencyTTLHours       int
+	DeadLetterTTLHours        int
+	SubjectRateLimitRPS       int
+	SubjectRateLimitBurst     int
+	SubjectRateLimitOverrides map[string]int
+	SchemaVersionRules        map[string]VersionRange
+	SchemaRequiredFields      map[string][]string
 	ModuleStartRetryMax       int
 	ModuleStartRetryBackoffMs int
 	NodeID                    string
@@ -78,6 +93,21 @@ func FromEnv() Config {
 		CircuitFailureThreshold:   intOr("CIRCUIT_FAILURE_THRESHOLD", 5),
 		CircuitOpenMs:             intOr("CIRCUIT_OPEN_MS", 15000),
 		CircuitHalfOpenSuccesses:  intOr("CIRCUIT_HALF_OPEN_SUCCESSES", 2),
+		PublishTimeoutMs:          intOr("PUBLISH_TIMEOUT_MS", 5000),
+		OutboxLeaseMs:             intOr("OUTBOX_LEASE_MS", 15000),
+		OutboxBackoffBaseMs:       intOr("OUTBOX_BACKOFF_BASE_MS", 500),
+		OutboxBackoffMaxMs:        intOr("OUTBOX_BACKOFF_MAX_MS", 30000),
+		OutboxBackoffJitterPct:    intOr("OUTBOX_BACKOFF_JITTER_PCT", 25),
+		OutboxQuarantineAfter:     intOr("OUTBOX_QUARANTINE_AFTER", 12),
+		CleanupIntervalMs:         intOr("CLEANUP_INTERVAL_MS", 30000),
+		CleanupBatchSize:          intOr("CLEANUP_BATCH_SIZE", 200),
+		IdempotencyTTLHours:       intOr("IDEMPOTENCY_TTL_HOURS", 24*14),
+		DeadLetterTTLHours:        intOr("DEAD_LETTER_TTL_HOURS", 24*30),
+		SubjectRateLimitRPS:       intOr("SUBJECT_RATE_LIMIT_RPS", 100),
+		SubjectRateLimitBurst:     intOr("SUBJECT_RATE_LIMIT_BURST", 200),
+		SubjectRateLimitOverrides: parseIntMap("SUBJECT_RATE_LIMIT_RPS_OVERRIDES"),
+		SchemaVersionRules:        parseSchemaVersionRules("EVENT_SCHEMA_VERSION_RULES"),
+		SchemaRequiredFields:      parseRequiredFieldRules("EVENT_SCHEMA_REQUIRED_FIELDS"),
 		ModuleStartRetryMax:       intOr("MODULE_START_RETRY_MAX", 4),
 		ModuleStartRetryBackoffMs: intOr("MODULE_START_RETRY_BACKOFF_MS", 1000),
 		NodeID:                    envOr("NODE_ID", hostOr("node-1")),
@@ -120,6 +150,11 @@ func FromEnv() Config {
 		OTELServiceName:           envOr("OTEL_SERVICE_NAME", "shiro-distributed-system"),
 		OTELExporterOTLPEndpoint:  envOr("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
+}
+
+type VersionRange struct {
+	Min int
+	Max int
 }
 
 func envOr(key, fallback string) string {
@@ -179,4 +214,97 @@ func int64Or(key string, fallback int64) int64 {
 		return fallback
 	}
 	return n
+}
+
+func parseIntMap(key string) map[string]int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	out := map[string]int{}
+	if raw == "" {
+		return out
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		if k == "" {
+			continue
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			continue
+		}
+		out[k] = n
+	}
+	return out
+}
+
+func parseSchemaVersionRules(key string) map[string]VersionRange {
+	raw := strings.TrimSpace(os.Getenv(key))
+	out := map[string]VersionRange{}
+	if raw == "" {
+		return out
+	}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		evt := strings.TrimSpace(parts[0])
+		rng := strings.TrimSpace(parts[1])
+		bounds := strings.SplitN(rng, "-", 2)
+		if len(bounds) != 2 {
+			continue
+		}
+		minV, err1 := strconv.Atoi(strings.TrimSpace(bounds[0]))
+		maxV, err2 := strconv.Atoi(strings.TrimSpace(bounds[1]))
+		if err1 != nil || err2 != nil || minV <= 0 || maxV < minV {
+			continue
+		}
+		out[evt] = VersionRange{Min: minV, Max: maxV}
+	}
+	return out
+}
+
+func parseRequiredFieldRules(key string) map[string][]string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	out := map[string][]string{}
+	if raw == "" {
+		return out
+	}
+	for _, entry := range strings.Split(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		evt := strings.TrimSpace(parts[0])
+		if evt == "" {
+			continue
+		}
+		fields := []string{}
+		for _, f := range strings.Split(parts[1], "|") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				fields = append(fields, f)
+			}
+		}
+		if len(fields) > 0 {
+			out[evt] = fields
+		}
+	}
+	return out
 }

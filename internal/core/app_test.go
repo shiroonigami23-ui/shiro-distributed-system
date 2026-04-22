@@ -95,12 +95,12 @@ func TestPublishWithRetryFails(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected publish failure")
 	}
-	// 2 main attempts + 1 best-effort DLQ attempt
-	if b.publishCalls != 3 {
-		t.Fatalf("expected 3 publish calls including DLQ, got %d", b.publishCalls)
+	// 2 main attempts (dead-letter handling is persisted in store path now).
+	if b.publishCalls != 2 {
+		t.Fatalf("expected 2 publish calls, got %d", b.publishCalls)
 	}
-	if b.lastSubject != "events.orders.dlq" {
-		t.Fatalf("expected last subject to be DLQ, got %q", b.lastSubject)
+	if b.lastSubject != "events.orders" {
+		t.Fatalf("expected last subject to be original subject, got %q", b.lastSubject)
 	}
 }
 

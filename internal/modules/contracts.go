@@ -27,6 +27,9 @@ type EventRecord struct {
 	Type           string    `json:"type"`
 	Payload        string    `json:"payload"`
 	OccurredAt     time.Time `json:"occurred_at"`
+	RetryCount     int       `json:"retry_count,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
+	QuarantinedAt  time.Time `json:"quarantined_at,omitempty"`
 }
 
 type AppendResult struct {
@@ -51,4 +54,23 @@ type EventStore interface {
 	PendingOutboxEvents(ctx context.Context, limit int) ([]EventRecord, error)
 	ClaimInboxMessage(ctx context.Context, consumer string, messageID string) (bool, error)
 	RecentEvents(ctx context.Context, stream string, limit int) ([]EventRecord, error)
+}
+
+// AdvancedEventStore extends EventStore with reliability controls for relay coordination,
+// failure handling, quarantine/dead-letter operations, and cleanup lifecycle hooks.
+type AdvancedEventStore interface {
+	EventStore
+	ClaimOutboxLease(ctx context.Context, eventID string, owner string, leaseDuration time.Duration) (bool, error)
+	RecordOutboxFailure(
+		ctx context.Context,
+		eventID string,
+		lastError string,
+		baseBackoff time.Duration,
+		maxBackoff time.Duration,
+		jitterPercent int,
+		quarantineAfter int,
+	) (quarantined bool, retryCount int, err error)
+	ListDeadLetters(ctx context.Context, limit int) ([]EventRecord, error)
+	ReplayDeadLetter(ctx context.Context, eventID string) error
+	CleanupExpired(ctx context.Context, idempotencyBefore time.Time, deadLetterBefore time.Time, limit int) (idempotencyDeleted int, deadLettersDeleted int, err error)
 }

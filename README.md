@@ -46,6 +46,12 @@ A production-grade distributed-system control plane focused on secure coordinati
 - Security headers middleware
 - Module startup retry with exponential backoff
 - Dependency circuit breakers (NATS, Cassandra, module readiness paths)
+- Outbox leasing to prevent duplicate relay processing in multi-node deployments
+- Persistent retry counters + backoff/jitter state in Cassandra
+- Poison-event quarantine and dead-letter replay endpoint
+- Automated cleanup for expired idempotency keys and aged dead letters
+- Type/schema version checks and required-field validation for payloads
+- Per-subject write rate limits
 - Prometheus metrics endpoint `/metrics`
 - Kubernetes deployment + HPA + ServiceMonitor manifests
 - CI workflow for formatting/build/test gates
@@ -59,6 +65,8 @@ A production-grade distributed-system control plane focused on secure coordinati
 - `GET /leaderz` current leader and node leadership (admin scope)
 - `POST /events` persist + publish event with idempotency (rw scope)
 - `GET /events?stream=<name>&limit=<n>` list recent events (rw scope)
+- `GET /deadletters?limit=<n>` list quarantined dead-letter events (admin scope)
+- `POST /deadletters/replay?id=<event_id>` replay quarantined event back to outbox (admin scope)
 - `GET /stream?subject=events.>&consumer=<name>` live event stream with inbox dedup (read scope)
 
 ## Auth + ACL
@@ -102,6 +110,21 @@ HTTP safety knobs:
 - `CIRCUIT_FAILURE_THRESHOLD`
 - `CIRCUIT_OPEN_MS`
 - `CIRCUIT_HALF_OPEN_SUCCESSES`
+- `PUBLISH_TIMEOUT_MS`
+- `OUTBOX_LEASE_MS`
+- `OUTBOX_BACKOFF_BASE_MS`
+- `OUTBOX_BACKOFF_MAX_MS`
+- `OUTBOX_BACKOFF_JITTER_PCT`
+- `OUTBOX_QUARANTINE_AFTER`
+- `CLEANUP_INTERVAL_MS`
+- `CLEANUP_BATCH_SIZE`
+- `IDEMPOTENCY_TTL_HOURS`
+- `DEAD_LETTER_TTL_HOURS`
+- `SUBJECT_RATE_LIMIT_RPS`
+- `SUBJECT_RATE_LIMIT_BURST`
+- `SUBJECT_RATE_LIMIT_RPS_OVERRIDES`
+- `EVENT_SCHEMA_VERSION_RULES`
+- `EVENT_SCHEMA_REQUIRED_FIELDS`
 - `MODULE_START_RETRY_MAX`
 - `MODULE_START_RETRY_BACKOFF_MS`
 

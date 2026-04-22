@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/modules"
 	"github.com/shiroonigami23-ui/shiro-distributed-system/internal/security"
 )
+
+const allBucket = "all"
 
 type Module struct {
 	hosts                 []string
@@ -118,6 +121,14 @@ payload_hash text,
 created_at timestamp,
 PRIMARY KEY ((stream), idempotency_key)
 )`,
+		`CREATE TABLE IF NOT EXISTS idempotency_by_created (
+bucket text,
+created_at timestamp,
+stream text,
+idempotency_key text,
+event_id timeuuid,
+PRIMARY KEY ((bucket), created_at, stream, idempotency_key)
+)`,
 		`CREATE TABLE IF NOT EXISTS outbox_events (
 event_id timeuuid PRIMARY KEY,
 stream text,
@@ -128,6 +139,17 @@ occurred_at timestamp,
 publish_state text,
 published_at timestamp,
 broker_message_id text
+)`,
+		`CREATE TABLE IF NOT EXISTS outbox_retry_state (
+event_id timeuuid PRIMARY KEY,
+retry_count int,
+next_attempt_at timestamp,
+last_error text,
+lease_owner text,
+lease_until timestamp,
+quarantined boolean,
+quarantined_at timestamp,
+first_failed_at timestamp
 )`,
 		`CREATE TABLE IF NOT EXISTS outbox_by_state (
 publish_state text,
@@ -144,6 +166,28 @@ consumer text,
 message_id text,
 consumed_at timestamp,
 PRIMARY KEY ((consumer), message_id)
+)`,
+		`CREATE TABLE IF NOT EXISTS dead_letters_by_time (
+bucket text,
+quarantined_at timestamp,
+event_id timeuuid,
+stream text,
+subject text,
+event_type text,
+payload text,
+retry_count int,
+last_error text,
+PRIMARY KEY ((bucket), quarantined_at, event_id)
+)`,
+		`CREATE TABLE IF NOT EXISTS dead_letters_by_id (
+event_id timeuuid PRIMARY KEY,
+quarantined_at timestamp,
+stream text,
+subject text,
+event_type text,
+payload text,
+retry_count int,
+last_error text
 )`,
 	}
 	for _, cql := range ddl {
@@ -230,6 +274,12 @@ func (m *Module) AppendEventExactlyOnce(ctx context.Context, event modules.Event
 			}
 			return modules.AppendResult{Event: existing, Duplicate: true, Published: published}, nil
 		}
+		if err := session.Query(
+			"INSERT INTO idempotency_by_created (bucket, created_at, stream, idempotency_key, event_id) VALUES (?, ?, ?, ?, ?)",
+			allBucket, time.Now().UTC(), event.Stream, event.IdempotencyKey, newID,
+		).WithContext(ctx).Exec(); err != nil {
+			return modules.AppendResult{}, err
+		}
 	}
 
 	batch := session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
@@ -248,6 +298,10 @@ func (m *Module) AppendEventExactlyOnce(ctx context.Context, event modules.Event
 	batch.Query(
 		"INSERT INTO outbox_by_state (publish_state, occurred_at, event_id, stream, subject, event_type, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		"pending", event.OccurredAt, newID, event.Stream, event.Subject, event.Type, event.Payload,
+	)
+	batch.Query(
+		"INSERT INTO outbox_retry_state (event_id, retry_count, next_attempt_at, last_error, lease_owner, lease_until, quarantined) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		newID, 0, event.OccurredAt, "", "", time.Unix(0, 0).UTC(), false,
 	)
 	if err := session.ExecuteBatch(batch); err != nil {
 		return modules.AppendResult{}, err
@@ -294,6 +348,10 @@ func (m *Module) MarkOutboxPublished(ctx context.Context, eventID string, broker
 		"DELETE FROM outbox_by_state WHERE publish_state = ? AND occurred_at = ? AND event_id = ?",
 		"pending", occurredAt, id,
 	)
+	batch.Query(
+		"DELETE FROM outbox_retry_state WHERE event_id = ?",
+		id,
+	)
 	return session.ExecuteBatch(batch)
 }
 
@@ -313,13 +371,17 @@ func (m *Module) PendingOutboxEvents(ctx context.Context, limit int) ([]modules.
 	if limit <= 0 {
 		limit = 100
 	}
-	if limit > 1000 {
-		limit = 1000
+	if limit > 2000 {
+		limit = 2000
+	}
+	fetchLimit := limit * 5
+	if fetchLimit < 100 {
+		fetchLimit = 100
 	}
 
 	iter := session.Query(
 		"SELECT occurred_at, event_id, stream, subject, event_type, payload FROM outbox_by_state WHERE publish_state = ? LIMIT ?",
-		"pending", limit,
+		"pending", fetchLimit,
 	).WithContext(ctx).Iter()
 
 	out := make([]modules.EventRecord, 0, limit)
@@ -332,6 +394,14 @@ func (m *Module) PendingOutboxEvents(ctx context.Context, limit int) ([]modules.
 		payload    string
 	)
 	for iter.Scan(&occurredAt, &id, &stream, &subject, &eventType, &payload) {
+		retryCount, nextAttemptAt, quarantined, leaseUntil, err := m.loadRetryState(ctx, session, id)
+		if err != nil {
+			continue
+		}
+		now := time.Now().UTC()
+		if quarantined || nextAttemptAt.After(now) || leaseUntil.After(now) {
+			continue
+		}
 		out = append(out, modules.EventRecord{
 			ID:         id.String(),
 			Stream:     stream,
@@ -339,7 +409,11 @@ func (m *Module) PendingOutboxEvents(ctx context.Context, limit int) ([]modules.
 			Type:       eventType,
 			Payload:    payload,
 			OccurredAt: occurredAt.UTC(),
+			RetryCount: retryCount,
 		})
+		if len(out) >= limit {
+			break
+		}
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -428,6 +502,326 @@ func (m *Module) isOutboxPublished(ctx context.Context, session *gocql.Session, 
 		return false, err
 	}
 	return state == "published", nil
+}
+
+func (m *Module) ClaimOutboxLease(ctx context.Context, eventID string, owner string, leaseDuration time.Duration) (bool, error) {
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return false, errors.New("cassandra session not available")
+	}
+	id, err := gocql.ParseUUID(eventID)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UTC()
+	leaseUntil := now.Add(leaseDuration)
+	var currentLeaseUntil time.Time
+	applied, err := session.Query(
+		"UPDATE outbox_retry_state SET lease_owner = ?, lease_until = ? WHERE event_id = ? IF lease_until < ?",
+		owner, leaseUntil, id, now,
+	).WithContext(ctx).ScanCAS(&currentLeaseUntil)
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+func (m *Module) RecordOutboxFailure(
+	ctx context.Context,
+	eventID string,
+	lastError string,
+	baseBackoff time.Duration,
+	maxBackoff time.Duration,
+	jitterPercent int,
+	quarantineAfter int,
+) (bool, int, error) {
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return false, 0, errors.New("cassandra session not available")
+	}
+	id, err := gocql.ParseUUID(eventID)
+	if err != nil {
+		return false, 0, err
+	}
+	var (
+		retryCount  int
+		firstFailed time.Time
+	)
+	err = session.Query(
+		"SELECT retry_count, first_failed_at FROM outbox_retry_state WHERE event_id = ?",
+		id,
+	).WithContext(ctx).Scan(&retryCount, &firstFailed)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			retryCount = 0
+		} else {
+			return false, 0, err
+		}
+	}
+	retryCount++
+	wait := baseBackoff
+	for i := 1; i < retryCount; i++ {
+		wait *= 2
+		if wait >= maxBackoff {
+			wait = maxBackoff
+			break
+		}
+	}
+	if jitterPercent > 0 {
+		jitterRange := int(wait.Milliseconds()) * jitterPercent / 100
+		if jitterRange > 0 {
+			delta := rand.Intn(jitterRange*2+1) - jitterRange
+			wait += time.Duration(delta) * time.Millisecond
+			if wait < 10*time.Millisecond {
+				wait = 10 * time.Millisecond
+			}
+		}
+	}
+	now := time.Now().UTC()
+	nextAttempt := now.Add(wait)
+	quarantined := retryCount >= quarantineAfter
+	if firstFailed.IsZero() {
+		firstFailed = now
+	}
+
+	err = session.Query(
+		"UPDATE outbox_retry_state SET retry_count = ?, next_attempt_at = ?, last_error = ?, lease_owner = ?, lease_until = ?, quarantined = ?, quarantined_at = ?, first_failed_at = ? WHERE event_id = ?",
+		retryCount, nextAttempt, lastError, "", time.Unix(0, 0).UTC(), quarantined, now, firstFailed, id,
+	).WithContext(ctx).Exec()
+	if err != nil {
+		return false, retryCount, err
+	}
+	if !quarantined {
+		return false, retryCount, nil
+	}
+
+	var (
+		stream    string
+		subject   string
+		eventType string
+		payload   string
+	)
+	err = session.Query(
+		"SELECT stream, subject, event_type, payload FROM outbox_events WHERE event_id = ?",
+		id,
+	).WithContext(ctx).Scan(&stream, &subject, &eventType, &payload)
+	if err != nil {
+		return true, retryCount, err
+	}
+	batch := session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	batch.Query(
+		"INSERT INTO dead_letters_by_time (bucket, quarantined_at, event_id, stream, subject, event_type, payload, retry_count, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		allBucket, now, id, stream, subject, eventType, payload, retryCount, lastError,
+	)
+	batch.Query(
+		"INSERT INTO dead_letters_by_id (event_id, quarantined_at, stream, subject, event_type, payload, retry_count, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		id, now, stream, subject, eventType, payload, retryCount, lastError,
+	)
+	return true, retryCount, session.ExecuteBatch(batch)
+}
+
+func (m *Module) ListDeadLetters(ctx context.Context, limit int) ([]modules.EventRecord, error) {
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return nil, errors.New("cassandra session not available")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	iter := session.Query(
+		"SELECT quarantined_at, event_id, stream, subject, event_type, payload, retry_count, last_error FROM dead_letters_by_time WHERE bucket = ? LIMIT ?",
+		allBucket, limit,
+	).WithContext(ctx).Iter()
+	out := make([]modules.EventRecord, 0, limit)
+	var (
+		quarantinedAt time.Time
+		id            gocql.UUID
+		stream        string
+		subject       string
+		eventType     string
+		payload       string
+		retryCount    int
+		lastError     string
+	)
+	for iter.Scan(&quarantinedAt, &id, &stream, &subject, &eventType, &payload, &retryCount, &lastError) {
+		out = append(out, modules.EventRecord{
+			ID:            id.String(),
+			Stream:        stream,
+			Subject:       subject,
+			Type:          eventType,
+			Payload:       payload,
+			RetryCount:    retryCount,
+			LastError:     lastError,
+			QuarantinedAt: quarantinedAt.UTC(),
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (m *Module) ReplayDeadLetter(ctx context.Context, eventID string) error {
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return errors.New("cassandra session not available")
+	}
+	id, err := gocql.ParseUUID(eventID)
+	if err != nil {
+		return err
+	}
+	var (
+		quarantinedAt time.Time
+		stream        string
+		subject       string
+		eventType     string
+		payload       string
+		retryCount    int
+		lastError     string
+	)
+	err = session.Query(
+		"SELECT quarantined_at, stream, subject, event_type, payload, retry_count, last_error FROM dead_letters_by_id WHERE event_id = ?",
+		id,
+	).WithContext(ctx).Scan(&quarantinedAt, &stream, &subject, &eventType, &payload, &retryCount, &lastError)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+
+	var occurredAt time.Time
+	err = session.Query(
+		"SELECT occurred_at FROM outbox_events WHERE event_id = ?",
+		id,
+	).WithContext(ctx).Scan(&occurredAt)
+	if err != nil {
+		if !errors.Is(err, gocql.ErrNotFound) {
+			return err
+		}
+		occurredAt = now
+	}
+	batch := session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	batch.Query(
+		"INSERT INTO outbox_events (event_id, stream, subject, event_type, payload, occurred_at, publish_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		id, stream, subject, eventType, payload, occurredAt, "pending",
+	)
+	batch.Query(
+		"INSERT INTO outbox_by_state (publish_state, occurred_at, event_id, stream, subject, event_type, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"pending", occurredAt, id, stream, subject, eventType, payload,
+	)
+	batch.Query(
+		"UPDATE outbox_retry_state SET quarantined = ?, quarantined_at = ?, retry_count = ?, next_attempt_at = ?, last_error = ?, lease_owner = ?, lease_until = ? WHERE event_id = ?",
+		false, time.Unix(0, 0).UTC(), retryCount, now, "", "", time.Unix(0, 0).UTC(), id,
+	)
+	batch.Query(
+		"DELETE FROM dead_letters_by_time WHERE bucket = ? AND quarantined_at = ? AND event_id = ?",
+		allBucket, quarantinedAt, id,
+	)
+	batch.Query(
+		"DELETE FROM dead_letters_by_id WHERE event_id = ?",
+		id,
+	)
+	return session.ExecuteBatch(batch)
+}
+
+func (m *Module) CleanupExpired(ctx context.Context, idempotencyBefore time.Time, deadLetterBefore time.Time, limit int) (int, int, error) {
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+	if session == nil {
+		return 0, 0, errors.New("cassandra session not available")
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	idemDeleted := 0
+	dlDeleted := 0
+
+	type idemRow struct {
+		createdAt      time.Time
+		stream         string
+		idempotencyKey string
+	}
+	idemRows := make([]idemRow, 0, limit)
+	iter := session.Query(
+		"SELECT created_at, stream, idempotency_key FROM idempotency_by_created WHERE bucket = ? LIMIT ?",
+		allBucket, limit,
+	).WithContext(ctx).Iter()
+	var createdAt time.Time
+	var stream, idKey string
+	for iter.Scan(&createdAt, &stream, &idKey) {
+		if createdAt.Before(idempotencyBefore) {
+			idemRows = append(idemRows, idemRow{createdAt: createdAt, stream: stream, idempotencyKey: idKey})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return 0, 0, err
+	}
+	for _, row := range idemRows {
+		batch := session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+		batch.Query("DELETE FROM idempotency_keys WHERE stream = ? AND idempotency_key = ?", row.stream, row.idempotencyKey)
+		batch.Query("DELETE FROM idempotency_by_created WHERE bucket = ? AND created_at = ? AND stream = ? AND idempotency_key = ?", allBucket, row.createdAt, row.stream, row.idempotencyKey)
+		if err := session.ExecuteBatch(batch); err == nil {
+			idemDeleted++
+		}
+	}
+
+	type dlRow struct {
+		quarantinedAt time.Time
+		eventID       gocql.UUID
+	}
+	dlRows := make([]dlRow, 0, limit)
+	iter = session.Query(
+		"SELECT quarantined_at, event_id FROM dead_letters_by_time WHERE bucket = ? LIMIT ?",
+		allBucket, limit,
+	).WithContext(ctx).Iter()
+	var quarantinedAt time.Time
+	var eventID gocql.UUID
+	for iter.Scan(&quarantinedAt, &eventID) {
+		if quarantinedAt.Before(deadLetterBefore) {
+			dlRows = append(dlRows, dlRow{quarantinedAt: quarantinedAt, eventID: eventID})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return idemDeleted, 0, err
+	}
+	for _, row := range dlRows {
+		batch := session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+		batch.Query("DELETE FROM dead_letters_by_time WHERE bucket = ? AND quarantined_at = ? AND event_id = ?", allBucket, row.quarantinedAt, row.eventID)
+		batch.Query("DELETE FROM dead_letters_by_id WHERE event_id = ?", row.eventID)
+		if err := session.ExecuteBatch(batch); err == nil {
+			dlDeleted++
+		}
+	}
+
+	return idemDeleted, dlDeleted, nil
+}
+
+func (m *Module) loadRetryState(ctx context.Context, session *gocql.Session, eventID gocql.UUID) (int, time.Time, bool, time.Time, error) {
+	var (
+		retryCount  int
+		nextAttempt time.Time
+		quarantined bool
+		leaseUntil  time.Time
+	)
+	err := session.Query(
+		"SELECT retry_count, next_attempt_at, quarantined, lease_until FROM outbox_retry_state WHERE event_id = ?",
+		eventID,
+	).WithContext(ctx).Scan(&retryCount, &nextAttempt, &quarantined, &leaseUntil)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return 0, time.Unix(0, 0).UTC(), false, time.Unix(0, 0).UTC(), nil
+		}
+		return 0, time.Time{}, false, time.Time{}, err
+	}
+	return retryCount, nextAttempt, quarantined, leaseUntil, nil
 }
 
 func sha256Hex(data string) string {

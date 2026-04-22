@@ -31,3 +31,25 @@ func TestIntOr(t *testing.T) {
 		t.Fatalf("expected fallback 7, got %d", got)
 	}
 }
+
+func TestParseSchemaVersionRules(t *testing.T) {
+	t.Setenv("TEST_SCHEMA_RULES", "order.created:1-3,payment.captured:2-2,bad")
+	got := parseSchemaVersionRules("TEST_SCHEMA_RULES")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rules, got %#v", got)
+	}
+	if got["order.created"].Min != 1 || got["order.created"].Max != 3 {
+		t.Fatalf("bad range: %#v", got["order.created"])
+	}
+}
+
+func TestParseRequiredFieldRules(t *testing.T) {
+	t.Setenv("TEST_REQ_RULES", "order.created=orderId|customerId;payment.captured=paymentId")
+	got := parseRequiredFieldRules("TEST_REQ_RULES")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rules, got %#v", got)
+	}
+	if len(got["order.created"]) != 2 {
+		t.Fatalf("unexpected fields: %#v", got["order.created"])
+	}
+}

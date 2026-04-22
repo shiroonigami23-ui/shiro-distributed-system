@@ -33,17 +33,17 @@ Status key:
 27. Dependency circuit breaker (etcd) - `DONE`
 28. Bulkhead isolation for publish pipeline - `DONE`
 29. Bulkhead isolation for query pipeline - `DONE`
-30. Outbox lease/claim ownership to avoid duplicate relay workers - `GAP`
-31. Outbox poisoned-message quarantine queue - `GAP`
-32. Outbox retry attempt counters persisted in DB - `GAP`
-33. Outbox exponential backoff with jitter persisted by record - `GAP`
-34. Publish timeout budget propagation - `GAP`
-35. Per-subject publish quota/limits - `GAP`
-36. Dead-letter replay endpoint - `GAP`
-37. Dead-letter retention policy and cleanup job - `GAP`
-38. End-to-end idempotency key TTL/expiration policy - `GAP`
-39. Payload schema versioning and compatibility checks - `GAP`
-40. Input JSON schema validation - `GAP`
+30. Outbox lease/claim ownership to avoid duplicate relay workers - `DONE`
+31. Outbox poisoned-message quarantine queue - `DONE`
+32. Outbox retry attempt counters persisted in DB - `DONE`
+33. Outbox exponential backoff with jitter persisted by record - `DONE`
+34. Publish timeout budget propagation - `DONE`
+35. Per-subject publish quota/limits - `DONE`
+36. Dead-letter replay endpoint - `DONE`
+37. Dead-letter retention policy and cleanup job - `DONE`
+38. End-to-end idempotency key TTL/expiration policy - `DONE`
+39. Payload schema versioning and compatibility checks - `DONE`
+40. Input JSON schema validation - `DONE`
 41. Event type registry and unknown-type reject policy - `GAP`
 42. Tenant isolation (tenant_id partitioning) - `GAP`
 43. Tenant-aware auth scopes - `GAP`

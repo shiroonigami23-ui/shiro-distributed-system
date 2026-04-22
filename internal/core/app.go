@@ -51,12 +51,14 @@ type App struct {
 	busBreaker     *circuitBreaker
 	storeBreaker   *circuitBreaker
 	moduleBreakers map[string]*circuitBreaker
+	subjectLimiter *subjectRateLimiter
 }
 
 type publishRequest struct {
 	Stream         string          `json:"stream"`
 	Subject        string          `json:"subject"`
 	Type           string          `json:"type"`
+	SchemaVersion  int             `json:"schema_version,omitempty"`
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	Payload        json.RawMessage `json:"payload"`
 }
@@ -101,6 +103,11 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 	a.guard = make(chan struct{}, max(1, cfg.MaxConcurrentRequests))
 	a.pubGuard = make(chan struct{}, max(1, cfg.MaxConcurrentPublishes))
 	a.queryGuard = make(chan struct{}, max(1, cfg.MaxConcurrentQueries))
+	a.subjectLimiter = newSubjectRateLimiter(
+		rate.Limit(max(1, cfg.SubjectRateLimitRPS)),
+		max(1, cfg.SubjectRateLimitBurst),
+		cfg.SubjectRateLimitOverrides,
+	)
 	a.busBreaker = newCircuitBreaker(
 		"nats",
 		max(1, cfg.CircuitFailureThreshold),
@@ -142,10 +149,15 @@ func (a *App) Run(ctx context.Context) error {
 	mux.HandleFunc("/startupz", a.handleStartup)
 	mux.Handle("/leaderz", a.secure("admin", http.HandlerFunc(a.handleLeader)))
 	mux.Handle("/events", a.secure("rw", http.HandlerFunc(a.handleEvents)))
+	mux.Handle("/deadletters", a.secure("admin", http.HandlerFunc(a.handleDeadLetters)))
+	mux.Handle("/deadletters/replay", a.secure("admin", http.HandlerFunc(a.handleReplayDeadLetter)))
 	mux.Handle("/stream", a.secure("read", http.HandlerFunc(a.handleStream)))
 
 	if a.store != nil && a.bus != nil {
 		go a.runOutboxRelay(ctx)
+	}
+	if _, ok := a.store.(modules.AdvancedEventStore); ok {
+		go a.runCleanupLoop(ctx)
 	}
 
 	srv := &http.Server{
@@ -485,11 +497,22 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "event"
 	}
+	if req.SchemaVersion <= 0 {
+		req.SchemaVersion = 1
+	}
 	if req.IdempotencyKey == "" {
 		req.IdempotencyKey = r.Header.Get("Idempotency-Key")
 	}
 	if len(req.Payload) == 0 {
 		req.Payload = json.RawMessage(`{}`)
+	}
+	if err := a.validatePublishRequest(req); err != nil {
+		http.Error(w, "validation error: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if a.subjectLimiter != nil && !a.subjectLimiter.Allow(req.Subject) {
+		http.Error(w, "subject rate limit exceeded", http.StatusTooManyRequests)
+		return
 	}
 
 	event := modules.EventRecord{
@@ -510,7 +533,14 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	if !result.Published {
 		brokerID, err := a.publishWithRetry(r.Context(), result.Event.Subject, []byte(result.Event.Payload), result.Event.ID)
 		if err != nil {
-			http.Error(w, "publish error: "+err.Error(), http.StatusInternalServerError)
+			quarantined, retries := a.recordOutboxFailure(r.Context(), result.Event.ID, err)
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"id":          result.Event.ID,
+				"queued":      true,
+				"quarantined": quarantined,
+				"retryCount":  retries,
+				"error":       err.Error(),
+			})
 			return
 		}
 		if err := a.storeMarkOutboxPublished(r.Context(), result.Event.ID, brokerID); err != nil {
@@ -531,6 +561,83 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 		"occurredAt":     result.Event.OccurredAt,
 		"idempotencyKey": result.Event.IdempotencyKey,
 		"duplicate":      result.Duplicate,
+	})
+}
+
+func (a *App) validatePublishRequest(req publishRequest) error {
+	var payload any
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return errors.New("payload must be valid JSON")
+	}
+	obj, ok := payload.(map[string]any)
+	if !ok {
+		return errors.New("payload must be a JSON object")
+	}
+
+	if rule, ok := a.cfg.SchemaVersionRules[req.Type]; ok {
+		if req.SchemaVersion < rule.Min || req.SchemaVersion > rule.Max {
+			return fmt.Errorf("schema_version %d out of allowed range %d-%d for type %s", req.SchemaVersion, rule.Min, rule.Max, req.Type)
+		}
+	}
+	if fields, ok := a.cfg.SchemaRequiredFields[req.Type]; ok {
+		for _, f := range fields {
+			if _, exists := obj[f]; !exists {
+				return fmt.Errorf("missing required payload field %q for type %s", f, req.Type)
+			}
+		}
+	}
+	return nil
+}
+
+func (a *App) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	adv, ok := a.store.(modules.AdvancedEventStore)
+	if !ok {
+		http.Error(w, "advanced dead-letter store unavailable", http.StatusNotImplemented)
+		return
+	}
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	events, err := adv.ListDeadLetters(r.Context(), limit)
+	if err != nil {
+		http.Error(w, "dead-letter query error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":      len(events),
+		"deadLetter": events,
+	})
+}
+
+func (a *App) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	adv, ok := a.store.(modules.AdvancedEventStore)
+	if !ok {
+		http.Error(w, "advanced dead-letter store unavailable", http.StatusNotImplemented)
+		return
+	}
+	eventID := strings.TrimSpace(r.URL.Query().Get("id"))
+	if eventID == "" {
+		http.Error(w, "missing dead-letter id", http.StatusBadRequest)
+		return
+	}
+	if err := adv.ReplayDeadLetter(r.Context(), eventID); err != nil {
+		http.Error(w, "replay error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":       eventID,
+		"replayed": true,
 	})
 }
 
@@ -633,6 +740,11 @@ func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) publishWithRetry(ctx context.Context, subject string, payload []byte, messageID string) (string, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline && a.cfg.PublishTimeoutMs > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(a.cfg.PublishTimeoutMs)*time.Millisecond)
+		defer cancel()
+	}
 	ctx, span := appTracer(a).Start(ctx, "publishWithRetry", trace.WithAttributes(
 		attribute.String("messaging.destination", subject),
 		attribute.String("messaging.message_id", messageID),
@@ -684,21 +796,6 @@ func (a *App) publishWithRetry(ctx context.Context, subject string, payload []by
 	if a.pubFailures != nil {
 		a.pubFailures.Inc()
 	}
-	// Best-effort dead-letter publish for offline analysis.
-	dlq := "events.dlq"
-	if subject != "" {
-		dlq = subject + ".dlq"
-	}
-	dlqMsg := map[string]any{
-		"subject":   subject,
-		"messageId": messageID,
-		"error":     lastErr.Error(),
-		"payload":   string(payload),
-		"failedAt":  time.Now().UTC(),
-	}
-	if raw, err := json.Marshal(dlqMsg); err == nil {
-		_, _ = a.busPublish(context.Background(), dlq, raw, messageID+"-dlq")
-	}
 	span.RecordError(lastErr)
 	span.SetStatus(codes.Error, "publish failed")
 	return "", lastErr
@@ -738,8 +835,12 @@ func (a *App) relayOutboxBatch(ctx context.Context) error {
 	}
 	span.SetAttributes(attribute.Int("outbox.pending", len(pending)))
 	for _, evt := range pending {
+		if !a.claimOutboxLease(ctx, evt.ID) {
+			continue
+		}
 		brokerID, err := a.publishWithRetry(ctx, evt.Subject, []byte(evt.Payload), evt.ID)
 		if err != nil {
+			_, _ = a.recordOutboxFailure(ctx, evt.ID, err)
 			continue
 		}
 		if err := a.storeMarkOutboxPublished(ctx, evt.ID, brokerID); err != nil {
@@ -747,6 +848,55 @@ func (a *App) relayOutboxBatch(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (a *App) claimOutboxLease(ctx context.Context, eventID string) bool {
+	adv, ok := a.store.(modules.AdvancedEventStore)
+	if !ok {
+		return true
+	}
+	okLease, err := adv.ClaimOutboxLease(ctx, eventID, a.cfg.NodeID, time.Duration(max(1000, a.cfg.OutboxLeaseMs))*time.Millisecond)
+	return err == nil && okLease
+}
+
+func (a *App) recordOutboxFailure(ctx context.Context, eventID string, publishErr error) (bool, int) {
+	adv, ok := a.store.(modules.AdvancedEventStore)
+	if !ok {
+		return false, 0
+	}
+	quarantined, retries, err := adv.RecordOutboxFailure(
+		ctx,
+		eventID,
+		publishErr.Error(),
+		time.Duration(max(50, a.cfg.OutboxBackoffBaseMs))*time.Millisecond,
+		time.Duration(max(200, a.cfg.OutboxBackoffMaxMs))*time.Millisecond,
+		max(0, a.cfg.OutboxBackoffJitterPct),
+		max(1, a.cfg.OutboxQuarantineAfter),
+	)
+	if err != nil {
+		return false, retries
+	}
+	return quarantined, retries
+}
+
+func (a *App) runCleanupLoop(ctx context.Context) {
+	adv, ok := a.store.(modules.AdvancedEventStore)
+	if !ok {
+		return
+	}
+	interval := time.Duration(max(1000, a.cfg.CleanupIntervalMs)) * time.Millisecond
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			idemBefore := time.Now().UTC().Add(-time.Duration(max(1, a.cfg.IdempotencyTTLHours)) * time.Hour)
+			dlBefore := time.Now().UTC().Add(-time.Duration(max(1, a.cfg.DeadLetterTTLHours)) * time.Hour)
+			_, _, _ = adv.CleanupExpired(ctx, idemBefore, dlBefore, max(1, a.cfg.CleanupBatchSize))
+		}
+	}
 }
 
 func (a *App) busPublish(ctx context.Context, subject string, payload []byte, messageID string) (string, error) {
@@ -1124,4 +1274,42 @@ func releaseGuard(ch chan struct{}) {
 	case <-ch:
 	default:
 	}
+}
+
+type subjectRateLimiter struct {
+	defaultR  rate.Limit
+	defaultB  int
+	overrides map[string]int
+	mu        sync.Mutex
+	limiters  map[string]*rate.Limiter
+}
+
+func newSubjectRateLimiter(defaultR rate.Limit, defaultB int, overrides map[string]int) *subjectRateLimiter {
+	cp := map[string]int{}
+	for k, v := range overrides {
+		cp[k] = v
+	}
+	return &subjectRateLimiter{
+		defaultR:  defaultR,
+		defaultB:  max(1, defaultB),
+		overrides: cp,
+		limiters:  map[string]*rate.Limiter{},
+	}
+}
+
+func (l *subjectRateLimiter) Allow(subject string) bool {
+	l.mu.Lock()
+	lim, ok := l.limiters[subject]
+	if !ok {
+		r := l.defaultR
+		b := l.defaultB
+		if ov, exists := l.overrides[subject]; exists && ov > 0 {
+			r = rate.Limit(ov)
+			b = max(1, ov*2)
+		}
+		lim = rate.NewLimiter(r, b)
+		l.limiters[subject] = lim
+	}
+	l.mu.Unlock()
+	return lim.Allow()
 }
