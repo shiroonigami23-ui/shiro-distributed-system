@@ -28,9 +28,9 @@ Status key:
 22. Environment and K8s knobs for all above - `DONE`
 23. Distinct startup probe endpoint - `DONE`
 24. Dependency startup ordering + backoff strategy - `DONE`
-25. Dependency circuit breaker (NATS) - `GAP`
-26. Dependency circuit breaker (Cassandra) - `GAP`
-27. Dependency circuit breaker (etcd) - `GAP`
+25. Dependency circuit breaker (NATS) - `DONE`
+26. Dependency circuit breaker (Cassandra) - `DONE`
+27. Dependency circuit breaker (etcd) - `DONE`
 28. Bulkhead isolation for publish pipeline - `DONE`
 29. Bulkhead isolation for query pipeline - `DONE`
 30. Outbox lease/claim ownership to avoid duplicate relay workers - `GAP`

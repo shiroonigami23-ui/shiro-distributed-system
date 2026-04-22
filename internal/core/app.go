@@ -38,16 +38,19 @@ type App struct {
 	coord modules.Coordinator
 	store modules.EventStore
 
-	reqs        *prometheus.CounterVec
-	lat         *prometheus.HistogramVec
-	pubRetries  prometheus.Counter
-	pubFailures prometheus.Counter
-	tracer      trace.Tracer
-	limiter     *ipRateLimiter
-	guard       chan struct{}
-	pubGuard    chan struct{}
-	queryGuard  chan struct{}
-	started     atomic.Bool
+	reqs           *prometheus.CounterVec
+	lat            *prometheus.HistogramVec
+	pubRetries     prometheus.Counter
+	pubFailures    prometheus.Counter
+	tracer         trace.Tracer
+	limiter        *ipRateLimiter
+	guard          chan struct{}
+	pubGuard       chan struct{}
+	queryGuard     chan struct{}
+	started        atomic.Bool
+	busBreaker     *circuitBreaker
+	storeBreaker   *circuitBreaker
+	moduleBreakers map[string]*circuitBreaker
 }
 
 type publishRequest struct {
@@ -98,6 +101,27 @@ func New(cfg config.Config, ms ...modules.Module) *App {
 	a.guard = make(chan struct{}, max(1, cfg.MaxConcurrentRequests))
 	a.pubGuard = make(chan struct{}, max(1, cfg.MaxConcurrentPublishes))
 	a.queryGuard = make(chan struct{}, max(1, cfg.MaxConcurrentQueries))
+	a.busBreaker = newCircuitBreaker(
+		"nats",
+		max(1, cfg.CircuitFailureThreshold),
+		time.Duration(max(1000, cfg.CircuitOpenMs))*time.Millisecond,
+		max(1, cfg.CircuitHalfOpenSuccesses),
+	)
+	a.storeBreaker = newCircuitBreaker(
+		"cassandra",
+		max(1, cfg.CircuitFailureThreshold),
+		time.Duration(max(1000, cfg.CircuitOpenMs))*time.Millisecond,
+		max(1, cfg.CircuitHalfOpenSuccesses),
+	)
+	a.moduleBreakers = make(map[string]*circuitBreaker, len(ms))
+	for _, m := range ms {
+		a.moduleBreakers[m.Name()] = newCircuitBreaker(
+			m.Name(),
+			max(1, cfg.CircuitFailureThreshold),
+			time.Duration(max(1000, cfg.CircuitOpenMs))*time.Millisecond,
+			max(1, cfg.CircuitHalfOpenSuccesses),
+		)
+	}
 	return a
 }
 
@@ -337,7 +361,21 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	overallReady := true
 	for _, m := range a.modules {
 		start := time.Now()
+		mb := a.moduleBreakers[m.Name()]
+		if mb != nil && !mb.Allow() {
+			overallReady = false
+			statuses = append(statuses, moduleStatus{
+				Name:      m.Name(),
+				Ready:     false,
+				Error:     "circuit open",
+				LatencyMs: time.Since(start).Milliseconds(),
+			})
+			continue
+		}
 		if err := m.Ready(tctx); err != nil {
+			if mb != nil {
+				mb.Failure()
+			}
 			overallReady = false
 			statuses = append(statuses, moduleStatus{
 				Name:      m.Name(),
@@ -346,6 +384,9 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 				LatencyMs: time.Since(start).Milliseconds(),
 			})
 			continue
+		}
+		if mb != nil {
+			mb.Success()
 		}
 		statuses = append(statuses, moduleStatus{
 			Name:      m.Name(),
@@ -460,7 +501,7 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 		OccurredAt:     time.Now().UTC(),
 	}
 
-	result, err := a.store.AppendEventExactlyOnce(r.Context(), event)
+	result, err := a.storeAppendEventExactlyOnce(r.Context(), event)
 	if err != nil {
 		http.Error(w, "store error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -472,7 +513,7 @@ func (a *App) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "publish error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if err := a.store.MarkOutboxPublished(r.Context(), result.Event.ID, brokerID); err != nil {
+		if err := a.storeMarkOutboxPublished(r.Context(), result.Event.ID, brokerID); err != nil {
 			http.Error(w, "outbox update error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -516,7 +557,7 @@ func (a *App) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events, err := a.store.RecentEvents(r.Context(), stream, limit)
+	events, err := a.storeRecentEvents(r.Context(), stream, limit)
 	if err != nil {
 		http.Error(w, "query error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -572,7 +613,7 @@ func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		case msg := <-ch:
 			if a.store != nil && msg.MessageID != "" {
-				ok, err := a.store.ClaimInboxMessage(r.Context(), consumer, msg.MessageID)
+				ok, err := a.storeClaimInboxMessage(r.Context(), consumer, msg.MessageID)
 				if err != nil || !ok {
 					continue
 				}
@@ -614,7 +655,7 @@ func (a *App) publishWithRetry(ctx context.Context, subject string, payload []by
 	var lastErr error
 	wait := backoff
 	for attempt := 1; attempt <= attempts; attempt++ {
-		id, err := a.bus.Publish(ctx, subject, payload, messageID)
+		id, err := a.busPublish(ctx, subject, payload, messageID)
 		if err == nil {
 			span.SetAttributes(attribute.Int("publish.attempt", attempt))
 			return id, nil
@@ -656,7 +697,7 @@ func (a *App) publishWithRetry(ctx context.Context, subject string, payload []by
 		"failedAt":  time.Now().UTC(),
 	}
 	if raw, err := json.Marshal(dlqMsg); err == nil {
-		_, _ = a.bus.Publish(context.Background(), dlq, raw, messageID+"-dlq")
+		_, _ = a.busPublish(context.Background(), dlq, raw, messageID+"-dlq")
 	}
 	span.RecordError(lastErr)
 	span.SetStatus(codes.Error, "publish failed")
@@ -690,7 +731,7 @@ func (a *App) relayOutboxBatch(ctx context.Context) error {
 	defer span.End()
 
 	batchSize := max(1, a.cfg.OutboxRelayBatchSize)
-	pending, err := a.store.PendingOutboxEvents(ctx, batchSize)
+	pending, err := a.storePendingOutboxEvents(ctx, batchSize)
 	if err != nil {
 		span.RecordError(err)
 		return err
@@ -701,11 +742,131 @@ func (a *App) relayOutboxBatch(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
-		if err := a.store.MarkOutboxPublished(ctx, evt.ID, brokerID); err != nil {
+		if err := a.storeMarkOutboxPublished(ctx, evt.ID, brokerID); err != nil {
 			span.RecordError(err)
 		}
 	}
 	return nil
+}
+
+func (a *App) busPublish(ctx context.Context, subject string, payload []byte, messageID string) (string, error) {
+	if a.bus == nil {
+		return "", errors.New("event bus not configured")
+	}
+	if a.busBreaker != nil && !a.busBreaker.Allow() {
+		return "", errors.New("nats circuit open")
+	}
+	id, err := a.bus.Publish(ctx, subject, payload, messageID)
+	if err != nil {
+		if a.busBreaker != nil {
+			a.busBreaker.Failure()
+		}
+		return "", err
+	}
+	if a.busBreaker != nil {
+		a.busBreaker.Success()
+	}
+	return id, nil
+}
+
+func (a *App) storeAppendEventExactlyOnce(ctx context.Context, event modules.EventRecord) (modules.AppendResult, error) {
+	if a.store == nil {
+		return modules.AppendResult{}, errors.New("event store not configured")
+	}
+	if a.storeBreaker != nil && !a.storeBreaker.Allow() {
+		return modules.AppendResult{}, errors.New("cassandra circuit open")
+	}
+	res, err := a.store.AppendEventExactlyOnce(ctx, event)
+	if err != nil {
+		if a.storeBreaker != nil {
+			a.storeBreaker.Failure()
+		}
+		return modules.AppendResult{}, err
+	}
+	if a.storeBreaker != nil {
+		a.storeBreaker.Success()
+	}
+	return res, nil
+}
+
+func (a *App) storeMarkOutboxPublished(ctx context.Context, eventID string, brokerMessageID string) error {
+	if a.store == nil {
+		return errors.New("event store not configured")
+	}
+	if a.storeBreaker != nil && !a.storeBreaker.Allow() {
+		return errors.New("cassandra circuit open")
+	}
+	err := a.store.MarkOutboxPublished(ctx, eventID, brokerMessageID)
+	if err != nil {
+		if a.storeBreaker != nil {
+			a.storeBreaker.Failure()
+		}
+		return err
+	}
+	if a.storeBreaker != nil {
+		a.storeBreaker.Success()
+	}
+	return nil
+}
+
+func (a *App) storePendingOutboxEvents(ctx context.Context, limit int) ([]modules.EventRecord, error) {
+	if a.store == nil {
+		return nil, errors.New("event store not configured")
+	}
+	if a.storeBreaker != nil && !a.storeBreaker.Allow() {
+		return nil, errors.New("cassandra circuit open")
+	}
+	events, err := a.store.PendingOutboxEvents(ctx, limit)
+	if err != nil {
+		if a.storeBreaker != nil {
+			a.storeBreaker.Failure()
+		}
+		return nil, err
+	}
+	if a.storeBreaker != nil {
+		a.storeBreaker.Success()
+	}
+	return events, nil
+}
+
+func (a *App) storeClaimInboxMessage(ctx context.Context, consumer string, messageID string) (bool, error) {
+	if a.store == nil {
+		return false, errors.New("event store not configured")
+	}
+	if a.storeBreaker != nil && !a.storeBreaker.Allow() {
+		return false, errors.New("cassandra circuit open")
+	}
+	ok, err := a.store.ClaimInboxMessage(ctx, consumer, messageID)
+	if err != nil {
+		if a.storeBreaker != nil {
+			a.storeBreaker.Failure()
+		}
+		return false, err
+	}
+	if a.storeBreaker != nil {
+		a.storeBreaker.Success()
+	}
+	return ok, nil
+}
+
+func (a *App) storeRecentEvents(ctx context.Context, stream string, limit int) ([]modules.EventRecord, error) {
+	if a.store == nil {
+		return nil, errors.New("event store not configured")
+	}
+	if a.storeBreaker != nil && !a.storeBreaker.Allow() {
+		return nil, errors.New("cassandra circuit open")
+	}
+	events, err := a.store.RecentEvents(ctx, stream, limit)
+	if err != nil {
+		if a.storeBreaker != nil {
+			a.storeBreaker.Failure()
+		}
+		return nil, err
+	}
+	if a.storeBreaker != nil {
+		a.storeBreaker.Success()
+	}
+	return events, nil
 }
 
 type statusRecorder struct {
@@ -849,6 +1010,84 @@ func appTracer(a *App) trace.Tracer {
 		return a.tracer
 	}
 	return otel.Tracer("shiro.core")
+}
+
+type breakerState int
+
+const (
+	breakerClosed breakerState = iota
+	breakerOpen
+	breakerHalfOpen
+)
+
+type circuitBreaker struct {
+	name              string
+	failureThreshold  int
+	openDuration      time.Duration
+	halfOpenSuccesses int
+
+	mu                  sync.Mutex
+	state               breakerState
+	consecutiveFailures int
+	consecutiveSuccess  int
+	openedAt            time.Time
+}
+
+func newCircuitBreaker(name string, threshold int, openDuration time.Duration, halfOpenSuccesses int) *circuitBreaker {
+	return &circuitBreaker{
+		name:              name,
+		failureThreshold:  max(1, threshold),
+		openDuration:      openDuration,
+		halfOpenSuccesses: max(1, halfOpenSuccesses),
+		state:             breakerClosed,
+	}
+}
+
+func (b *circuitBreaker) Allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch b.state {
+	case breakerClosed:
+		return true
+	case breakerOpen:
+		if time.Since(b.openedAt) >= b.openDuration {
+			b.state = breakerHalfOpen
+			b.consecutiveSuccess = 0
+			return true
+		}
+		return false
+	case breakerHalfOpen:
+		return true
+	default:
+		return true
+	}
+}
+
+func (b *circuitBreaker) Success() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch b.state {
+	case breakerHalfOpen:
+		b.consecutiveSuccess++
+		if b.consecutiveSuccess >= b.halfOpenSuccesses {
+			b.state = breakerClosed
+			b.consecutiveFailures = 0
+			b.consecutiveSuccess = 0
+		}
+	case breakerClosed:
+		b.consecutiveFailures = 0
+	}
+}
+
+func (b *circuitBreaker) Failure() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.consecutiveFailures++
+	b.consecutiveSuccess = 0
+	if b.consecutiveFailures >= b.failureThreshold || b.state == breakerHalfOpen {
+		b.state = breakerOpen
+		b.openedAt = time.Now()
+	}
 }
 
 type requestIDContextKey struct{}

@@ -191,3 +191,26 @@ func TestHandleStartup(t *testing.T) {
 		t.Fatalf("expected 200 after started, got %d", rec.Code)
 	}
 }
+
+func TestCircuitBreakerTransitions(t *testing.T) {
+	b := newCircuitBreaker("test", 2, 50*time.Millisecond, 1)
+	if !b.Allow() {
+		t.Fatalf("expected closed breaker to allow")
+	}
+	b.Failure()
+	if !b.Allow() {
+		t.Fatalf("expected breaker to still allow after 1 failure")
+	}
+	b.Failure()
+	if b.Allow() {
+		t.Fatalf("expected breaker to open after threshold failures")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if !b.Allow() {
+		t.Fatalf("expected half-open breaker to allow probe request")
+	}
+	b.Success()
+	if !b.Allow() {
+		t.Fatalf("expected breaker to close after success in half-open")
+	}
+}

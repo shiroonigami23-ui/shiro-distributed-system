@@ -17,6 +17,9 @@ type Config struct {
 	MaxConcurrentRequests     int
 	MaxConcurrentPublishes    int
 	MaxConcurrentQueries      int
+	CircuitFailureThreshold   int
+	CircuitOpenMs             int
+	CircuitHalfOpenSuccesses  int
 	ModuleStartRetryMax       int
 	ModuleStartRetryBackoffMs int
 	NodeID                    string
@@ -72,6 +75,9 @@ func FromEnv() Config {
 		MaxConcurrentRequests:     intOr("MAX_CONCURRENT_REQUESTS", 500),
 		MaxConcurrentPublishes:    intOr("MAX_CONCURRENT_PUBLISHES", 200),
 		MaxConcurrentQueries:      intOr("MAX_CONCURRENT_QUERIES", 300),
+		CircuitFailureThreshold:   intOr("CIRCUIT_FAILURE_THRESHOLD", 5),
+		CircuitOpenMs:             intOr("CIRCUIT_OPEN_MS", 15000),
+		CircuitHalfOpenSuccesses:  intOr("CIRCUIT_HALF_OPEN_SUCCESSES", 2),
 		ModuleStartRetryMax:       intOr("MODULE_START_RETRY_MAX", 4),
 		ModuleStartRetryBackoffMs: intOr("MODULE_START_RETRY_BACKOFF_MS", 1000),
 		NodeID:                    envOr("NODE_ID", hostOr("node-1")),

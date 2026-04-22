@@ -14,6 +14,14 @@
   <img alt="API" src="https://img.shields.io/badge/API-REST%20%2B%20SSE-8E44AD?style=for-the-badge">
 </p>
 
+<p align="center">
+  <a href="https://github.com/shiroonigami23-ui/shiro-distributed-system/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shiroonigami23-ui/shiro-distributed-system/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/shiroonigami23-ui/shiro-distributed-system/actions/workflows/hardening-ci.yml"><img alt="Hardening CI" src="https://github.com/shiroonigami23-ui/shiro-distributed-system/actions/workflows/hardening-ci.yml/badge.svg"></a>
+  <a href="https://github.com/shiroonigami23-ui/shiro-distributed-system/actions/workflows/checklist-gate.yml"><img alt="Checklist Gate" src="https://github.com/shiroonigami23-ui/shiro-distributed-system/actions/workflows/checklist-gate.yml/badge.svg"></a>
+  <img alt="Last Commit" src="https://img.shields.io/github/last-commit/shiroonigami23-ui/shiro-distributed-system">
+  <img alt="Repo Size" src="https://img.shields.io/github/repo-size/shiroonigami23-ui/shiro-distributed-system">
+</p>
+
 A production-grade distributed-system control plane focused on secure coordination, reliable eventing, and durable state.
 
 ## Core Features
@@ -37,6 +45,7 @@ A production-grade distributed-system control plane focused on secure coordinati
 - Dedicated publish/query bulkhead lanes
 - Security headers middleware
 - Module startup retry with exponential backoff
+- Dependency circuit breakers (NATS, Cassandra, module readiness paths)
 - Prometheus metrics endpoint `/metrics`
 - Kubernetes deployment + HPA + ServiceMonitor manifests
 - CI workflow for formatting/build/test gates
@@ -90,6 +99,9 @@ HTTP safety knobs:
 - `MAX_CONCURRENT_REQUESTS`
 - `MAX_CONCURRENT_PUBLISHES`
 - `MAX_CONCURRENT_QUERIES`
+- `CIRCUIT_FAILURE_THRESHOLD`
+- `CIRCUIT_OPEN_MS`
+- `CIRCUIT_HALF_OPEN_SUCCESSES`
 - `MODULE_START_RETRY_MAX`
 - `MODULE_START_RETRY_BACKOFF_MS`
 
