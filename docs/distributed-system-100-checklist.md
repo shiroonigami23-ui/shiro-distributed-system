@@ -87,7 +87,7 @@ Status key:
 81. Controlled maintenance mode endpoint - `GAP`
 82. Node drain mode for graceful traffic migration - `GAP`
 83. Cluster membership introspection endpoint - `GAP`
-84. Admin endpoint for outbox relay pause/resume - `GAP`
+84. Admin endpoint for outbox relay pause/resume - `DONE`
 85. Clock skew detection and warnings - `GAP`
 86. Monotonic sequence generation for event ordering - `GAP`
 87. Duplicate delivery audit endpoint - `GAP`

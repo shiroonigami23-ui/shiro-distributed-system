@@ -49,6 +49,7 @@ A production-grade distributed-system control plane focused on secure coordinati
 - Outbox leasing to prevent duplicate relay processing in multi-node deployments
 - Persistent retry counters + backoff/jitter state in Cassandra
 - Poison-event quarantine and dead-letter replay endpoint
+- Admin pause/resume control for outbox relay workers
 - Automated cleanup for expired idempotency keys and aged dead letters
 - Type/schema version checks and required-field validation for payloads
 - Event type registry with unknown-type reject policy
@@ -73,6 +74,8 @@ A production-grade distributed-system control plane focused on secure coordinati
 - `GET /events?stream=<name>&limit=<n>` list recent events (rw scope)
 - `GET /deadletters?limit=<n>` list quarantined dead-letter events (admin scope)
 - `POST /deadletters/replay?id=<event_id>` replay quarantined event back to outbox (admin scope)
+- `GET /admin/outbox-relay` view relay pause status (admin scope)
+- `POST /admin/outbox-relay?action=pause|resume` control relay processing (admin scope)
 - `GET /stream?subject=events.>&consumer=<name>` live event stream with inbox dedup (read scope)
 
 ## Auth + ACL

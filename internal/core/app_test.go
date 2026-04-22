@@ -276,3 +276,34 @@ func TestValidatePublishRequestAllowsKnownEventType(t *testing.T) {
 		t.Fatalf("expected request to validate, got %v", err)
 	}
 }
+
+func TestHandleOutboxRelayAdmin(t *testing.T) {
+	a := &App{}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/admin/outbox-relay", nil)
+	getRec := httptest.NewRecorder()
+	a.handleOutboxRelayAdmin(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from status, got %d", getRec.Code)
+	}
+
+	pauseReq := httptest.NewRequest(http.MethodPost, "/admin/outbox-relay?action=pause", nil)
+	pauseRec := httptest.NewRecorder()
+	a.handleOutboxRelayAdmin(pauseRec, pauseReq)
+	if pauseRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from pause, got %d", pauseRec.Code)
+	}
+	if !a.outboxPaused.Load() {
+		t.Fatalf("expected outbox relay to be paused")
+	}
+
+	resumeReq := httptest.NewRequest(http.MethodPost, "/admin/outbox-relay?action=resume", nil)
+	resumeRec := httptest.NewRecorder()
+	a.handleOutboxRelayAdmin(resumeRec, resumeReq)
+	if resumeRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from resume, got %d", resumeRec.Code)
+	}
+	if a.outboxPaused.Load() {
+		t.Fatalf("expected outbox relay to be resumed")
+	}
+}

@@ -54,6 +54,7 @@ type App struct {
 	subjectLimiter *subjectRateLimiter
 	authGuard      *authFailureGuard
 	eventTypes     map[string]struct{}
+	outboxPaused   atomic.Bool
 }
 
 type publishRequest struct {
@@ -164,6 +165,7 @@ func (a *App) Run(ctx context.Context) error {
 	mux.Handle("/events", a.secure("rw", http.HandlerFunc(a.handleEvents)))
 	mux.Handle("/deadletters", a.secure("admin", http.HandlerFunc(a.handleDeadLetters)))
 	mux.Handle("/deadletters/replay", a.secure("admin", http.HandlerFunc(a.handleReplayDeadLetter)))
+	mux.Handle("/admin/outbox-relay", a.secure("admin", http.HandlerFunc(a.handleOutboxRelayAdmin)))
 	mux.Handle("/stream", a.secure("read", http.HandlerFunc(a.handleStream)))
 
 	if a.store != nil && a.bus != nil {
@@ -722,6 +724,32 @@ func (a *App) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) handleOutboxRelayAdmin(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"paused": a.outboxPaused.Load(),
+		})
+	case http.MethodPost:
+		action := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("action")))
+		switch action {
+		case "pause":
+			a.outboxPaused.Store(true)
+		case "resume":
+			a.outboxPaused.Store(false)
+		default:
+			http.Error(w, "invalid action, expected pause|resume", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"paused": a.outboxPaused.Load(),
+			"action": action,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (a *App) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	if !acquireGuard(a.queryGuard) {
 		http.Error(w, "query lane busy", http.StatusServiceUnavailable)
@@ -891,6 +919,9 @@ func (a *App) runOutboxRelay(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if a.outboxPaused.Load() {
+				continue
+			}
 			if a.coord != nil && !a.coord.IsLeader() {
 				continue
 			}
